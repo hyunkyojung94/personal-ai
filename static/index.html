@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Personal AI</title>
+<style>
+  :root {
+    --bg: #fafaf9; --surface: #ffffff; --text: #1c1917; --muted: #78716c;
+    --border: #e7e5e4; --accent: #2563eb; --user-bg: #2563eb; --user-text: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1917; --surface: #292524; --text: #f5f5f4; --muted: #a8a29e;
+      --border: #44403c; --accent: #60a5fa; --user-bg: #1d4ed8; --user-text: #ffffff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 16px; padding-top: max(12px, env(safe-area-inset-top));
+    border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;
+  }
+  [hidden] { display: none !important; }
+  header button { background: none; border: none; color: var(--accent); font: inherit; cursor: pointer; }
+  .tabs { display: flex; gap: 4px; background: var(--border); border-radius: 10px; padding: 2px; }
+  .tabs button { color: var(--text); padding: 4px 14px; border-radius: 8px; font-weight: 600; }
+  .tabs button[aria-current="page"] { background: var(--surface); }
+  .view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 88%; padding: 10px 14px; border-radius: 16px; overflow-wrap: anywhere; }
+  .user { align-self: flex-end; background: var(--user-bg); color: var(--user-text); white-space: pre-wrap; }
+  .assistant { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); }
+  .assistant p { margin: 0 0 8px; } .assistant p:last-child { margin-bottom: 0; }
+  .assistant ul { margin: 0 0 8px; padding-left: 20px; }
+  .assistant h3 { font-size: 16px; margin: 8px 0 4px; }
+  .assistant code { font-size: 14px; }
+  details { color: var(--muted); font-size: 14px; margin-bottom: 8px; white-space: pre-wrap; }
+  summary { cursor: pointer; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .error { color: #dc2626; }
+  .empty { color: var(--muted); text-align: center; margin: auto; padding: 0 24px; }
+  #form, .journal {
+    display: flex; gap: 8px; padding: 12px 16px;
+    padding-bottom: max(12px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border);
+  }
+  .journal { padding-bottom: 12px; border-top: none; border-bottom: 1px solid var(--border); }
+  textarea {
+    flex: 1; resize: none; font: inherit; color: var(--text); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 20px; padding: 9px 14px; max-height: 40vh;
+  }
+  .primary {
+    background: var(--accent); color: #fff; border: none; border-radius: 20px;
+    padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .primary:disabled { opacity: .5; }
+  .secondary {
+    background: none; color: var(--muted); border: 1px solid var(--border); border-radius: 20px;
+    padding: 0 12px; font: inherit; cursor: pointer;
+  }
+  #think[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #notes-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+  #notes-list button {
+    width: 100%; text-align: left; background: none; border: none; border-bottom: 1px solid var(--border);
+    padding: 12px 16px; font: inherit; color: var(--text); cursor: pointer;
+  }
+  #notes-list small { display: block; color: var(--muted); font-size: 13px; }
+  .status { color: var(--muted); font-size: 13px; padding: 6px 16px; min-height: 1.5em; }
+  .status button { background: none; border: none; color: var(--accent); font: inherit; padding: 0; cursor: pointer; }
+  #editor-pane { padding: 0 16px 16px; gap: 10px; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+  .editor-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 12px; }
+  .editor-bar .status { padding: 0; text-align: right; }
+  #back { white-space: nowrap; flex-shrink: 0; height: 36px; }
+  #editor-path {
+    font: inherit; color: var(--text); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
+  }
+  #editor-path[readonly] { color: var(--muted); }
+  #editor { border-radius: 8px; max-height: none; font-size: 15px; }
+  .editor-actions { display: flex; justify-content: space-between; height: 40px; }
+  #delete { color: #dc2626; }
+</style>
+</head>
+<body>
+<header>
+  <nav class="tabs">
+    <button type="button" data-view="chat" aria-current="page">Chat</button>
+    <button type="button" data-view="notes">Notes</button>
+  </nav>
+  <button id="new" type="button">New chat</button>
+</header>
+<section id="chat-view" class="view">
+  <main id="log"><p class="empty">Ask about your notes, plans or journal.</p></main>
+  <form id="form">
+    <button id="think" class="secondary" type="button" aria-pressed="false" title="Think carefully before answering (slower)">Think</button>
+    <textarea id="input" rows="1" placeholder="Message" autofocus></textarea>
+    <button id="send" class="primary">Send</button>
+  </form>
+</section>
+<section id="notes-view" class="view" hidden>
+  <div id="list-pane" class="view">
+    <form id="journal-form" class="journal">
+      <textarea id="journal-input" rows="1" placeholder="Journal: how's today going?"></textarea>
+      <button class="primary">Add</button>
+    </form>
+    <div id="list-status" class="status"></div>
+    <ul id="notes-list"></ul>
+  </div>
+  <div id="editor-pane" class="view" hidden>
+    <div class="editor-bar">
+      <button id="back" type="button" class="secondary">‹ Notes</button>
+      <span id="editor-status" class="status"></span>
+    </div>
+    <input id="editor-path" placeholder="folder/name.md" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <textarea id="editor"></textarea>
+    <div class="editor-actions">
+      <button id="delete" type="button" class="secondary">Delete</button>
+      <button id="save" type="button" class="primary">Save</button>
+    </div>
+  </div>
+</section>
+<script>
+const log = document.getElementById("log");
+const form = document.getElementById("form");
+const input = document.getElementById("input");
+const send = document.getElementById("send");
+const thinkButton = document.getElementById("think");
+let messages = [];
+
+thinkButton.addEventListener("click", () => {
+  thinkButton.setAttribute("aria-pressed", String(thinkButton.getAttribute("aria-pressed") !== "true"));
+});
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+// Just enough Markdown for the model's answers. Text is escaped first, so the
+// model's output can never inject HTML into the page.
+function renderMarkdown(text) {
+  const inline = s => s
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+  let html = "", list = false;
+  for (const line of escapeHtml(text).split("\n")) {
+    const item = line.match(/^\s*[*-]\s+(.*)/);
+    if (item) {
+      if (!list) { html += "<ul>"; list = true; }
+      html += `<li>${inline(item[1])}</li>`;
+      continue;
+    }
+    if (list) { html += "</ul>"; list = false; }
+    const heading = line.match(/^#{1,6}\s+(.*)/);
+    if (heading) html += `<h3>${inline(heading[1])}</h3>`;
+    else if (line.trim()) html += `<p>${inline(line)}</p>`;
+  }
+  return html + (list ? "</ul>" : "");
+}
+
+function addBubble(cls) {
+  log.querySelector(".empty")?.remove();
+  const el = document.createElement("div");
+  el.className = `msg ${cls}`;
+  log.appendChild(el);
+  return el;
+}
+
+function scrollToBottom() { log.scrollTop = log.scrollHeight; }
+
+async function ask(question, think) {
+  messages.push({role: "user", content: question});
+  addBubble("user").textContent = question;
+  const bubble = addBubble("assistant");
+  const thinking = document.createElement("details");
+  thinking.innerHTML = "<summary>Thinking…</summary>";
+  const thinkingText = document.createElement("div");
+  thinking.appendChild(thinkingText);
+  const answerEl = document.createElement("div");
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  bubble.append(thinking, answerEl, meta);
+  scrollToBottom();
+
+  const start = performance.now();
+  let answer = "", firstToken = null;
+  try {
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({messages, think}),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffered = "";
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffered += value;
+      const lines = buffered.split("\n");
+      buffered = lines.pop();
+      for (const line of lines.filter(Boolean)) {
+        const {kind, value} = JSON.parse(line);
+        if (kind !== "timings" && kind !== "error") firstToken ??= performance.now();
+        if (kind === "reasoning") thinkingText.textContent += value;
+        else if (kind === "content") {
+          if (!answer) thinking.querySelector("summary").textContent = "Thought process";
+          answer += value;
+          answerEl.innerHTML = renderMarkdown(answer);
+        } else if (kind === "timings") {
+          meta.textContent = `${value.cache_n + value.prompt_n} prompt tokens · first token ` +
+            `${((firstToken - start) / 1000).toFixed(1)}s · ${Math.round(value.predicted_per_second)} tok/s`;
+        } else if (kind === "error") {
+          throw new Error(value);
+        }
+        scrollToBottom();
+      }
+    }
+    if (!thinkingText.textContent) thinking.remove();
+    messages.push({role: "assistant", content: answer});
+  } catch (error) {
+    messages.pop();  // Drop the unanswered question so the next request stays valid.
+    thinking.remove();
+    answerEl.innerHTML = `<span class="error">${escapeHtml(error.message)}</span>`;
+  }
+}
+
+form.addEventListener("submit", async event => {
+  event.preventDefault();
+  const question = input.value.trim();
+  if (!question || send.disabled) return;
+  input.value = "";
+  input.style.height = "";
+  send.disabled = true;
+  // Thinking applies to one message, then switches back off.
+  const think = thinkButton.getAttribute("aria-pressed") === "true";
+  thinkButton.setAttribute("aria-pressed", "false");
+  await ask(question, think);
+  send.disabled = false;
+});
+
+// Enter sends on a keyboard; Shift+Enter adds a line. On the phone, use Send.
+input.addEventListener("keydown", event => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && matchMedia("(pointer: fine)").matches) {
+    event.preventDefault();
+    form.requestSubmit();
+  }
+});
+input.addEventListener("input", () => {
+  input.style.height = "";
+  input.style.height = input.scrollHeight + "px";
+});
+
+// ---- Views ----
+
+const newButton = document.getElementById("new");
+let view = "chat";
+
+function showView(name) {
+  view = name;
+  for (const tab of document.querySelectorAll(".tabs button")) {
+    if (tab.dataset.view === name) tab.setAttribute("aria-current", "page");
+    else tab.removeAttribute("aria-current");
+  }
+  document.getElementById("chat-view").hidden = name !== "chat";
+  document.getElementById("notes-view").hidden = name !== "notes";
+  newButton.textContent = name === "chat" ? "New chat" : "New note";
+  if (name === "notes") loadNotes();
+}
+
+for (const tab of document.querySelectorAll(".tabs button")) {
+  tab.addEventListener("click", () => {
+    if (tab.dataset.view !== view && confirmDiscard()) { closeEditor(); showView(tab.dataset.view); }
+  });
+}
+
+newButton.addEventListener("click", () => {
+  if (view === "chat") {
+    messages = [];
+    log.innerHTML = '<p class="empty">Ask about your notes, plans or journal.</p>';
+  } else if (confirmDiscard()) {
+    openEditor({path: "", content: "# ", etag: null});
+  }
+});
+
+// ---- Notes ----
+
+const listPane = document.getElementById("list-pane");
+const listStatus = document.getElementById("list-status");
+const notesList = document.getElementById("notes-list");
+const editorPane = document.getElementById("editor-pane");
+const editorPath = document.getElementById("editor-path");
+const editor = document.getElementById("editor");
+const editorStatus = document.getElementById("editor-status");
+// The open note. etag is the version we loaded; null means a new, unsaved note.
+let current = null;
+
+// Encode "/" too, so the browser can't collapse "../" before the server sees
+// (and rejects) it.
+const encodePath = path => encodeURIComponent(path);
+
+function timeAgo(seconds) {
+  const minutes = Math.round((Date.now() / 1000 - seconds) / 60);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 60 * 24) return `${Math.round(minutes / 60)} h ago`;
+  return new Date(seconds * 1000).toLocaleDateString();
+}
+
+async function loadNotes() {
+  const response = await fetch("/api/notes");
+  notesList.innerHTML = "";
+  for (const note of await response.json()) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.textContent = note.title;
+    const detail = document.createElement("small");
+    detail.textContent = `${note.path} · ${timeAgo(note.modified)}`;
+    button.appendChild(detail);
+    button.addEventListener("click", () => openNote(note.path));
+    item.appendChild(button);
+    notesList.appendChild(item);
+  }
+}
+
+async function openNote(path) {
+  const response = await fetch(`/api/notes/${encodePath(path)}`);
+  if (!response.ok) { listStatus.textContent = `Couldn't open ${path} (${response.status})`; return; }
+  const {content} = await response.json();
+  openEditor({path, content, etag: response.headers.get("ETag")});
+}
+
+function openEditor(note) {
+  current = {...note, saved: note.content};
+  editorPath.value = note.path;
+  editorPath.readOnly = note.etag !== null;
+  editor.value = note.content;
+  editorStatus.textContent = "";
+  document.getElementById("delete").hidden = note.etag === null;
+  listPane.hidden = true;
+  editorPane.hidden = false;
+  (note.etag === null ? editorPath : editor).focus();
+}
+
+function closeEditor() {
+  current = null;
+  editorPane.hidden = true;
+  listPane.hidden = false;
+}
+
+function confirmDiscard() {
+  return !current || editor.value === current.saved || confirm("Discard unsaved changes?");
+}
+
+function showConflict(message) {
+  editorStatus.textContent = `${message} `;
+  const reload = document.createElement("button");
+  reload.textContent = "Reload (loses your edits)";
+  reload.addEventListener("click", () => openNote(current.path));
+  editorStatus.appendChild(reload);
+}
+
+document.getElementById("save").addEventListener("click", async () => {
+  let path = editorPath.value.trim();
+  if (!path) { editorStatus.textContent = "Give the note a name first."; return; }
+  if (!path.endsWith(".md")) path += ".md";
+  // Optimistic concurrency: say which version we're replacing (If-Match), or
+  // that the note must not exist yet (If-None-Match: *). The server answers
+  // 409 if someone else changed it in the meantime, instead of overwriting.
+  const precondition = current.etag ? {"If-Match": current.etag} : {"If-None-Match": "*"};
+  const response = await fetch(`/api/notes/${encodePath(path)}`, {
+    method: "PUT",
+    headers: {"Content-Type": "application/json", ...precondition},
+    body: JSON.stringify({content: editor.value}),
+  });
+  if (response.ok) {
+    current = {path, etag: response.headers.get("ETag"), saved: editor.value};
+    editorPath.value = path;
+    editorPath.readOnly = true;
+    document.getElementById("delete").hidden = false;
+    editorStatus.textContent = "Saved";
+  } else if (response.status === 409) {
+    if (current.etag) showConflict("This note changed somewhere else since you opened it.");
+    else editorStatus.textContent = "A note with that name already exists.";
+  } else if (response.status === 400) {
+    editorStatus.textContent = "Invalid name. Use something like training/plan.md.";
+  } else {
+    editorStatus.textContent = `Save failed (${response.status}).`;
+  }
+});
+
+document.getElementById("delete").addEventListener("click", async () => {
+  if (!confirm(`Delete ${current.path}? You can still recover it from the notes' git history.`)) return;
+  const response = await fetch(`/api/notes/${encodePath(current.path)}`, {
+    method: "DELETE",
+    headers: {"If-Match": current.etag},
+  });
+  if (response.ok) { closeEditor(); loadNotes(); }
+  else if (response.status === 409) showConflict("This note changed somewhere else; not deleted.");
+  else editorStatus.textContent = `Delete failed (${response.status}).`;
+});
+
+document.getElementById("back").addEventListener("click", () => {
+  if (confirmDiscard()) { closeEditor(); loadNotes(); }
+});
+
+document.getElementById("journal-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const journalInput = document.getElementById("journal-input");
+  const text = journalInput.value.trim();
+  if (!text) return;
+  const response = await fetch("/api/journal", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({text}),
+  });
+  if (response.ok) {
+    journalInput.value = "";
+    listStatus.textContent = `Added to ${(await response.json()).path}`;
+    loadNotes();
+  } else {
+    listStatus.textContent = `Couldn't add entry (${response.status}).`;
+  }
+});
+</script>
+</body>
+</html>
