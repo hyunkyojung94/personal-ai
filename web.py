@@ -7,11 +7,13 @@ address. Never on all interfaces, so people on the same café Wi-Fi can't reach 
 import json
 import subprocess
 import threading
+import time
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
+import chats
 import notes
 from assistant import chat
 
@@ -19,11 +21,12 @@ PORT = 8000
 INDEX = Path(__file__).parent / "static" / "index.html"
 # The Mac App Store version of Tailscale doesn't put its CLI on PATH.
 TAILSCALE_CLIS = ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
-NOTE_ERRORS = {
+ERROR_STATUS = {
     notes.InvalidPath: 400,
     notes.NotFound: 404,
     notes.Conflict: 409,
     notes.PreconditionRequired: 428,
+    chats.NotFound: 404,
 }
 
 # Names this server may be reached by, filled in at startup.
@@ -88,16 +91,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _note_path(self):
-        prefix = "/api/notes/"
+    def _tail(self, prefix):
+        """The rest of the path after `prefix`, or None if it doesn't match."""
         return unquote(self.path[len(prefix):]) if self.path.startswith(prefix) else None
 
-    def _handle_note_errors(self, action):
+    def _note_path(self):
+        return self._tail("/api/notes/")
+
+    def _handle_errors(self, action):
         try:
             action()
-        except notes.NoteError as error:
-            self._send_json(NOTE_ERRORS[type(error)], {"error": type(error).__name__})
-        except (KeyError, TypeError, ValueError):
+        except (notes.NoteError, chats.NotFound) as error:
+            self._send_json(ERROR_STATUS[type(error)], {"error": type(error).__name__})
+        except (AttributeError, KeyError, TypeError, ValueError):
             self.send_error(400)
 
     def do_GET(self):
@@ -116,12 +122,31 @@ class Handler(BaseHTTPRequestHandler):
             def read():
                 content, tag = notes.read_note(path)
                 self._send_json(200, {"path": path, "content": content}, [("ETag", tag)])
-            self._handle_note_errors(read)
+            self._handle_errors(read)
+        elif self.path == "/api/conversations":
+            self._send_json(200, chats.list_conversations())
+        elif conversation_id := self._tail("/api/conversations/"):
+            self._handle_errors(
+                lambda: self._send_json(200, chats.get_conversation(conversation_id))
+            )
         else:
             self.send_error(404)
 
     def do_PUT(self):
         if not self._allowed(has_body=True):
+            return
+        feedback_for = self._tail("/api/messages/")
+        if feedback_for and feedback_for.endswith("/feedback"):
+            def save_feedback():
+                body = self._read_json()
+                chats.set_feedback(
+                    int(feedback_for.removesuffix("/feedback")),
+                    body.get("rating"), list(body.get("reasons") or []),
+                    body.get("comment"), body.get("correction"),
+                )
+                self.send_response(204)
+                self.end_headers()
+            self._handle_errors(save_feedback)
             return
         if not (path := self._note_path()):
             self.send_error(404)
@@ -137,20 +162,26 @@ class Handler(BaseHTTPRequestHandler):
                 create_only=self.headers.get("If-None-Match") == "*",
             )
             self._send_json(200, {"path": path}, [("ETag", tag)])
-        self._handle_note_errors(write)
+        self._handle_errors(write)
 
     def do_DELETE(self):
         if not self._allowed(has_body=False):
             return
-        if not (path := self._note_path()):
+        if path := self._note_path():
+            def delete():
+                notes.delete_note(path, if_match=self.headers.get("If-Match"))
+        elif conversation_id := self._tail("/api/conversations/"):
+            def delete():
+                chats.delete_conversation(conversation_id)
+        else:
             self.send_error(404)
             return
 
-        def delete():
-            notes.delete_note(path, if_match=self.headers.get("If-Match"))
+        def delete_and_respond():
+            delete()
             self.send_response(204)
             self.end_headers()
-        self._handle_note_errors(delete)
+        self._handle_errors(delete_and_respond)
 
     def do_POST(self):
         if not self._allowed(has_body=True):
@@ -161,22 +192,30 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError
                 self._send_json(201, {"path": notes.append_journal(text)})
-            self._handle_note_errors(append)
+            self._handle_errors(append)
         elif self.path == "/api/chat":
             self._chat()
         else:
             self.send_error(404)
 
     def _chat(self):
+        """Answer `message` in conversation `conversation_id` (null starts a new one).
+
+        The history comes from the database, not the client, so a conversation
+        can continue on any device.
+        """
         try:
             body = self._read_json()
-            messages = [
-                {"role": m["role"], "content": str(m["content"])}
-                for m in body["messages"]
-                if m["role"] in ("user", "assistant")
-            ]
+            question = body["message"]
+            conversation_id = body.get("conversation_id")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError
             think = body.get("think") is True
-        except (KeyError, TypeError, ValueError):
+            history = chats.history(conversation_id) if conversation_id else []
+        except chats.NotFound:
+            self.send_error(404)
+            return
+        except (AttributeError, KeyError, TypeError, ValueError):
             self.send_error(400)
             return
 
@@ -189,9 +228,27 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"kind": kind, "value": value}).encode() + b"\n")
             self.wfile.flush()
 
+        start = time.monotonic()
+        pieces = {"content": [], "reasoning": []}
+        model = timings = None
         try:
-            for kind, value in chat(messages, think=think):
+            for kind, value in chat([*history, {"role": "user", "content": question}], think=think):
+                if kind == "model":
+                    model = value
+                    continue
+                if kind == "timings":
+                    timings = value
+                else:
+                    pieces[kind].append(value)
                 send(kind, value)
+            # Saved only once the answer is complete: an error or a closed page
+            # leaves no question without its answer in the history.
+            conversation_id, message_id = chats.save_turn(
+                conversation_id, question, "".join(pieces["content"]),
+                reasoning="".join(pieces["reasoning"]), think=think, model=model,
+                timings=timings, latency_ms=round((time.monotonic() - start) * 1000),
+            )
+            send("saved", {"conversation_id": conversation_id, "message_id": message_id})
         except urllib.error.HTTPError as error:
             send("error", f"Model server error {error.code}: {error.read().decode()}")
         except urllib.error.URLError:
@@ -202,6 +259,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     notes.ensure_repo()
+    chats.init()
     hosts = ["127.0.0.1"]
     ip, names = tailscale_self()
     if ip:

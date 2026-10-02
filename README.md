@@ -9,6 +9,7 @@ Current stage: a chat (terminal or web) that puts every note into the prompt (no
 - Code: this repo. No dependencies beyond Python 3 and `llama-server` (`brew install llama.cpp`).
 - Data: `~/personal-ai-data/` (override with `PERSONAL_AI_DATA`). Kept outside the repo so personal notes and the API key can't be committed.
   - `notes/` — Markdown notes and journal entries, any subfolders. Its own git repo: every save/delete from the web app is a commit, so `git -C ~/personal-ai-data/notes log` shows history and anything can be restored.
+  - `chats.sqlite` — conversations, messages (with model/think/token stats) and feedback (rating, reasons, comment, corrected answer). Inspect with `sqlite3 ~/personal-ai-data/chats.sqlite`.
   - `api-key` — created by `serve.sh` on first run.
 - Model: `~/models/gemma-4-26B_q4_0-it.gguf` (override with `MODEL`).
 

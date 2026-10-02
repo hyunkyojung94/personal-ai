@@ -43,7 +43,7 @@ def chat(messages, think=False):
     better for reflection and planning, but often 10-20x slower.
 
     Yields ("reasoning", text) and ("content", text) pieces as they arrive,
-    then ("timings", dict) with llama-server's speed stats.
+    then ("model", name) and ("timings", dict) with llama-server's speed stats.
     Raises urllib.error.HTTPError if the server rejects the request.
     """
     api_key = (DATA_DIR / "api-key").read_text().split()[0]
@@ -57,7 +57,7 @@ def chat(messages, think=False):
         }).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
     )
-    timings = None
+    timings = model = None
     with urllib.request.urlopen(request) as response:
         # Server-sent events: one "data: {json}" line per chunk.
         for line in response:
@@ -66,6 +66,7 @@ def chat(messages, think=False):
                 continue
             chunk = json.loads(line[len("data: "):])
             timings = chunk.get("timings", timings)
+            model = chunk.get("model", model)
             if not chunk.get("choices"):
                 continue
             delta = chunk["choices"][0]["delta"]
@@ -73,5 +74,7 @@ def chat(messages, think=False):
                 yield "reasoning", delta["reasoning_content"]
             if delta.get("content"):
                 yield "content", delta["content"]
+    if model:
+        yield "model", Path(model).name  # llama-server reports the model file's full path
     if timings:
         yield "timings", timings

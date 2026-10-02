@@ -65,12 +65,31 @@
     padding: 0 12px; font: inherit; cursor: pointer;
   }
   #think[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
-  #notes-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
-  #notes-list button {
-    width: 100%; text-align: left; background: none; border: none; border-bottom: 1px solid var(--border);
-    padding: 12px 16px; font: inherit; color: var(--text); cursor: pointer;
+  .list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+  .list li { display: flex; border-bottom: 1px solid var(--border); }
+  .list button {
+    flex: 1; min-width: 0; text-align: left; background: none; border: none;
+    padding: 12px 16px; font: inherit; color: var(--text); cursor: pointer; overflow-wrap: anywhere;
   }
-  #notes-list small { display: block; color: var(--muted); font-size: 13px; }
+  .list button.remove { flex: none; white-space: nowrap; color: var(--muted); padding: 12px 16px; }
+  .list small { display: block; color: var(--muted); font-size: 13px; }
+  .feedback { display: flex; align-items: center; gap: 4px; margin-top: 6px; font-size: 13px; }
+  .feedback button {
+    background: none; border: 1px solid transparent; border-radius: 12px; padding: 2px 8px;
+    font: inherit; color: var(--muted); cursor: pointer;
+  }
+  .feedback .rate { filter: grayscale(1); opacity: .6; }
+  .feedback .rate[aria-pressed="true"] { filter: none; opacity: 1; border-color: var(--border); }
+  .feedback-panel { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; font-size: 14px; }
+  .feedback-panel label { color: var(--muted); font-size: 13px; }
+  .feedback-panel textarea { border-radius: 8px; font-size: 14px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    background: none; border: 1px solid var(--border); border-radius: 14px; padding: 3px 10px;
+    font: inherit; font-size: 13px; color: var(--text); cursor: pointer;
+  }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .feedback-panel .primary { align-self: flex-end; height: 34px; }
   .status { color: var(--muted); font-size: 13px; padding: 6px 16px; min-height: 1.5em; }
   .status button { background: none; border: none; color: var(--accent); font: inherit; padding: 0; cursor: pointer; }
   #editor-pane { padding: 0 16px 16px; gap: 10px; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
@@ -92,6 +111,7 @@
   <nav class="tabs">
     <button type="button" data-view="chat" aria-current="page">Chat</button>
     <button type="button" data-view="notes">Notes</button>
+    <button type="button" data-view="history">History</button>
   </nav>
   <button id="new" type="button">New chat</button>
 </header>
@@ -110,7 +130,7 @@
       <button class="primary">Add</button>
     </form>
     <div id="list-status" class="status"></div>
-    <ul id="notes-list"></ul>
+    <ul id="notes-list" class="list"></ul>
   </div>
   <div id="editor-pane" class="view" hidden>
     <div class="editor-bar">
@@ -125,13 +145,27 @@
     </div>
   </div>
 </section>
+<section id="history-view" class="view" hidden>
+  <div id="history-status" class="status"></div>
+  <ul id="history-list" class="list"></ul>
+</section>
 <script>
 const log = document.getElementById("log");
 const form = document.getElementById("form");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
 const thinkButton = document.getElementById("think");
-let messages = [];
+// The server keeps the history; the page only remembers which conversation
+// it's in, so a reload (or another device) picks up where you left off.
+let conversationId = null;
+
+function rememberConversation(id) {
+  conversationId = id;
+  try {
+    if (id) localStorage.setItem("conversationId", id);
+    else localStorage.removeItem("conversationId");
+  } catch {}  // Storage can be unavailable (e.g. private browsing); the chat still works.
+}
 
 thinkButton.addEventListener("click", () => {
   thinkButton.setAttribute("aria-pressed", String(thinkButton.getAttribute("aria-pressed") !== "true"));
@@ -174,9 +208,7 @@ function addBubble(cls) {
 
 function scrollToBottom() { log.scrollTop = log.scrollHeight; }
 
-async function ask(question, think) {
-  messages.push({role: "user", content: question});
-  addBubble("user").textContent = question;
+function assistantBubble() {
   const bubble = addBubble("assistant");
   const thinking = document.createElement("details");
   thinking.innerHTML = "<summary>Thinking…</summary>";
@@ -186,6 +218,126 @@ async function ask(question, think) {
   const meta = document.createElement("div");
   meta.className = "meta";
   bubble.append(thinking, answerEl, meta);
+  return {bubble, thinking, thinkingText, answerEl, meta};
+}
+
+const REASONS = {
+  wrong_fact: "Wrong fact", missed_notes: "Missed my notes", made_up: "Made something up",
+  too_long: "Too long", not_helpful: "Not helpful", tone: "Tone",
+};
+
+// 👍/👎 is one tap. Details (reasons, a comment, or a corrected answer) are
+// optional: a corrected answer is both a training example and a preference
+// pair (yours over the model's) for fine-tuning later.
+function addFeedback(bubble, messageId, answer, saved) {
+  const state = {rating: null, reasons: [], comment: null, correction: null, ...saved};
+  const row = document.createElement("div");
+  row.className = "feedback";
+  const panel = document.createElement("div");
+  panel.className = "feedback-panel";
+  panel.hidden = true;
+  const status = document.createElement("span");
+
+  async function save() {
+    const response = await fetch(`/api/messages/${messageId}/feedback`, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(state),
+    });
+    status.textContent = response.ok ? "Saved" : `Failed (${response.status})`;
+  }
+
+  const rateButtons = [[1, "👍"], [-1, "👎"]].map(([rating, label]) => {
+    const button = document.createElement("button");
+    button.className = "rate";
+    button.textContent = label;
+    button.setAttribute("aria-label", rating === 1 ? "Good answer" : "Bad answer");
+    button.addEventListener("click", () => {
+      state.rating = state.rating === rating ? null : rating;
+      rateButtons.forEach(([r, b]) => b.setAttribute("aria-pressed", String(state.rating === r)));
+      if (state.rating === -1) panel.hidden = false;
+      save();
+    });
+    return [rating, button];
+  });
+  rateButtons.forEach(([r, b]) => b.setAttribute("aria-pressed", String(state.rating === r)));
+  const detailsButton = document.createElement("button");
+  detailsButton.textContent = "Details";
+  detailsButton.addEventListener("click", () => { panel.hidden = !panel.hidden; });
+  row.append(...rateButtons.map(([, b]) => b), detailsButton, status);
+
+  const chips = document.createElement("div");
+  chips.className = "chips";
+  for (const [key, label] of Object.entries(REASONS)) {
+    const chip = document.createElement("button");
+    chip.className = "chip";
+    chip.textContent = label;
+    chip.setAttribute("aria-pressed", String(state.reasons.includes(key)));
+    chip.addEventListener("click", () => {
+      state.reasons = state.reasons.includes(key)
+        ? state.reasons.filter(r => r !== key) : [...state.reasons, key];
+      chip.setAttribute("aria-pressed", String(state.reasons.includes(key)));
+    });
+    chips.appendChild(chip);
+  }
+  const comment = document.createElement("textarea");
+  comment.placeholder = "What was wrong or missing? (optional)";
+  comment.value = state.comment || "";
+  const correctionLabel = document.createElement("label");
+  correctionLabel.textContent = "Better answer (optional, edit the model's answer):";
+  const correction = document.createElement("textarea");
+  correction.rows = 5;
+  correction.value = state.correction || answer;
+  const saveButton = document.createElement("button");
+  saveButton.className = "primary";
+  saveButton.textContent = "Save feedback";
+  saveButton.addEventListener("click", () => {
+    state.comment = comment.value.trim() || null;
+    // Only an actual edit counts as a correction.
+    state.correction = correction.value.trim() && correction.value.trim() !== answer.trim()
+      ? correction.value.trim() : null;
+    save();
+  });
+  panel.append(chips, comment, correctionLabel, correction, saveButton);
+  bubble.append(row, panel);
+}
+
+function renderConversation(conversation) {
+  log.innerHTML = "";
+  for (const message of conversation.messages) {
+    if (message.role === "user") {
+      addBubble("user").textContent = message.content;
+      continue;
+    }
+    const {bubble, thinking, thinkingText, answerEl} = assistantBubble();
+    if (message.reasoning) {
+      thinking.querySelector("summary").textContent = "Thought process";
+      thinkingText.textContent = message.reasoning;
+    } else {
+      thinking.remove();
+    }
+    answerEl.innerHTML = renderMarkdown(message.content);
+    addFeedback(bubble, message.id, message.content, message.feedback);
+  }
+  if (!conversation.messages.length) startNewChat();
+  scrollToBottom();
+}
+
+async function openConversation(id) {
+  const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
+  if (!response.ok) { startNewChat(); return; }  // e.g. deleted on another device
+  rememberConversation(id);
+  renderConversation(await response.json());
+}
+
+function startNewChat() {
+  rememberConversation(null);
+  log.innerHTML = '<p class="empty">Ask about your notes, plans or journal.</p>';
+}
+
+async function ask(question, think) {
+  addBubble("user").textContent = question;
+  const {bubble, thinking, thinkingText, answerEl, meta} = assistantBubble();
   scrollToBottom();
 
   const start = performance.now();
@@ -194,7 +346,7 @@ async function ask(question, think) {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({messages, think}),
+      body: JSON.stringify({conversation_id: conversationId, message: question, think}),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -207,7 +359,7 @@ async function ask(question, think) {
       buffered = lines.pop();
       for (const line of lines.filter(Boolean)) {
         const {kind, value} = JSON.parse(line);
-        if (kind !== "timings" && kind !== "error") firstToken ??= performance.now();
+        if (kind === "reasoning" || kind === "content") firstToken ??= performance.now();
         if (kind === "reasoning") thinkingText.textContent += value;
         else if (kind === "content") {
           if (!answer) thinking.querySelector("summary").textContent = "Thought process";
@@ -216,6 +368,9 @@ async function ask(question, think) {
         } else if (kind === "timings") {
           meta.textContent = `${value.cache_n + value.prompt_n} prompt tokens · first token ` +
             `${((firstToken - start) / 1000).toFixed(1)}s · ${Math.round(value.predicted_per_second)} tok/s`;
+        } else if (kind === "saved") {
+          rememberConversation(value.conversation_id);
+          addFeedback(bubble, value.message_id, answer);
         } else if (kind === "error") {
           throw new Error(value);
         }
@@ -223,9 +378,9 @@ async function ask(question, think) {
       }
     }
     if (!thinkingText.textContent) thinking.remove();
-    messages.push({role: "assistant", content: answer});
   } catch (error) {
-    messages.pop();  // Drop the unanswered question so the next request stays valid.
+    // Nothing was saved for this turn; the next message continues from the
+    // last saved one.
     thinking.remove();
     answerEl.innerHTML = `<span class="error">${escapeHtml(error.message)}</span>`;
   }
@@ -270,8 +425,10 @@ function showView(name) {
   }
   document.getElementById("chat-view").hidden = name !== "chat";
   document.getElementById("notes-view").hidden = name !== "notes";
-  newButton.textContent = name === "chat" ? "New chat" : "New note";
+  document.getElementById("history-view").hidden = name !== "history";
+  newButton.textContent = name === "notes" ? "New note" : "New chat";
   if (name === "notes") loadNotes();
+  if (name === "history") loadHistory();
 }
 
 for (const tab of document.querySelectorAll(".tabs button")) {
@@ -281,13 +438,49 @@ for (const tab of document.querySelectorAll(".tabs button")) {
 }
 
 newButton.addEventListener("click", () => {
-  if (view === "chat") {
-    messages = [];
-    log.innerHTML = '<p class="empty">Ask about your notes, plans or journal.</p>';
+  if (view !== "notes") {
+    startNewChat();
+    showView("chat");
   } else if (confirmDiscard()) {
     openEditor({path: "", content: "# ", etag: null});
   }
 });
+
+// ---- History ----
+
+const historyList = document.getElementById("history-list");
+const historyStatus = document.getElementById("history-status");
+
+async function loadHistory() {
+  const conversations = await (await fetch("/api/conversations")).json();
+  historyStatus.textContent = conversations.length ? "" : "No conversations yet.";
+  historyList.innerHTML = "";
+  for (const conversation of conversations) {
+    const item = document.createElement("li");
+    const open = document.createElement("button");
+    open.textContent = conversation.title;
+    const detail = document.createElement("small");
+    detail.textContent = timeAgo(Date.parse(conversation.updated_at) / 1000);
+    open.appendChild(detail);
+    open.addEventListener("click", async () => {
+      await openConversation(conversation.id);
+      showView("chat");
+    });
+    const remove = document.createElement("button");
+    remove.className = "remove";
+    remove.textContent = "Delete";
+    remove.setAttribute("aria-label", `Delete "${conversation.title}"`);
+    remove.addEventListener("click", async () => {
+      if (!confirm(`Delete "${conversation.title}"? This can't be undone.`)) return;
+      const response = await fetch(`/api/conversations/${encodeURIComponent(conversation.id)}`, {method: "DELETE"});
+      if (!response.ok) { historyStatus.textContent = `Delete failed (${response.status})`; return; }
+      if (conversation.id === conversationId) startNewChat();
+      loadHistory();
+    });
+    item.append(open, remove);
+    historyList.appendChild(item);
+  }
+}
 
 // ---- Notes ----
 
@@ -428,6 +621,11 @@ document.getElementById("journal-form").addEventListener("submit", async event =
     listStatus.textContent = `Couldn't add entry (${response.status}).`;
   }
 });
+
+// Resume the conversation this browser was last in.
+let savedConversation = null;
+try { savedConversation = localStorage.getItem("conversationId"); } catch {}
+if (savedConversation) openConversation(savedConversation);
 </script>
 </body>
 </html>

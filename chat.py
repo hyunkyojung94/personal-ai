@@ -3,15 +3,18 @@
 import time
 import urllib.error
 
+import chats
 from assistant import NOTES_DIR, chat, load_notes
 
 DIM, RESET = "\033[2m", "\033[0m"
 
 
 def main():
+    chats.init()
     print(f"Loaded {len(load_notes())} notes from {NOTES_DIR}.")
     print("Start a message with /think for a slower, more careful answer. Ctrl+D to quit.")
     messages = []
+    conversation_id = None
 
     while True:
         try:
@@ -27,11 +30,15 @@ def main():
             continue
         messages.append({"role": "user", "content": question})
 
-        start, first_token, answer, timings, last_kind = time.monotonic(), None, [], None, None
+        start, first_token, last_kind = time.monotonic(), None, None
+        answer, reasoning, timings, model = [], [], None, None
         try:
             for kind, value in chat(messages, think=think):
                 if kind == "timings":
                     timings = value
+                    continue
+                if kind == "model":
+                    model = value
                     continue
                 first_token = first_token or time.monotonic()
                 if last_kind and kind != last_kind:
@@ -40,13 +47,17 @@ def main():
                 # The model "thinks" before answering; show that dimmed.
                 style = DIM if kind == "reasoning" else ""
                 print(f"{style}{value}{RESET if style else ''}", end="", flush=True)
-                if kind == "content":
-                    answer.append(value)
+                (answer if kind == "content" else reasoning).append(value)
         except urllib.error.HTTPError as error:
             print(f"Server error {error.code}: {error.read().decode()}")
             messages.pop()
             continue
         messages.append({"role": "assistant", "content": "".join(answer)})
+        conversation_id, _ = chats.save_turn(
+            conversation_id, question, "".join(answer),
+            reasoning="".join(reasoning), think=think, model=model, timings=timings,
+            latency_ms=round((time.monotonic() - start) * 1000),
+        )
 
         if timings and first_token:
             # The server caches the prompt prefix it has already read, so only
