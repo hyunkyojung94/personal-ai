@@ -33,6 +33,10 @@ class Conflict(NoteError):
     """The note changed since the client read it (or already exists)."""
 
 
+class DestinationExists(Conflict):
+    """A move would overwrite another note."""
+
+
 class PreconditionRequired(NoteError):
     """Writes must say which version they replace, so edits can't be lost silently."""
 
@@ -55,6 +59,14 @@ def _resolve(relative):
     return full
 
 
+def _remove_empty_folders(full):
+    """Folders exist only to hold notes, so drop any a move or delete emptied."""
+    folder = full.parent
+    while folder != NOTES_DIR.resolve() and not any(folder.iterdir()):
+        folder.rmdir()
+        folder = folder.parent
+
+
 def _git(*args):
     subprocess.run(
         ["git", "-C", str(NOTES_DIR), "-c", "user.name=personal-ai", "-c",
@@ -64,8 +76,16 @@ def _git(*args):
 
 
 def _commit(message, *paths):
-    _git("add", "-A", "--", *(str(p) for p in paths))
-    _git("commit", "-q", "--allow-empty", "-m", message, "--", *(str(p) for p in paths))
+    # Stage exactly these paths. A path git has never seen (e.g. a note made
+    # in another editor, then moved or deleted here) must not make this fail
+    # after the file has already changed on disk.
+    existing = [str(p) for p in paths if p.exists()]
+    gone = [str(p) for p in paths if not p.exists()]
+    if existing:
+        _git("add", "-A", "--", *existing)
+    if gone:
+        _git("rm", "-q", "--cached", "--ignore-unmatch", "--", *gone)
+    _git("commit", "-q", "--allow-empty", "-m", message)
 
 
 def ensure_repo():
@@ -133,6 +153,34 @@ def delete_note(relative, if_match):
             raise Conflict(relative)
         full.unlink()
         _commit(f"Delete {relative}", full)
+        _remove_empty_folders(full)
+
+
+def move_note(source, destination, if_match):
+    """Move or rename a note as one step: one atomic rename, one commit.
+
+    Never overwrites: fails if a different note already exists at
+    `destination`. Returns the note's ETag (unchanged, since content is too).
+    """
+    if if_match is None:
+        raise PreconditionRequired(source)
+    full_source, full_destination = _resolve(source), _resolve(destination)
+    with _write_lock:
+        if not full_source.is_file():
+            raise NotFound(source)
+        content = full_source.read_text()
+        if etag(content) != if_match:
+            raise Conflict(source)
+        # samefile allows case-only renames on macOS's case-insensitive disk.
+        if full_destination.exists() and not full_destination.samefile(full_source):
+            raise DestinationExists(destination)
+        full_destination.parent.mkdir(parents=True, exist_ok=True)
+        # rename() is atomic within one filesystem: the note is never in both
+        # places or neither.
+        full_source.rename(full_destination)
+        _commit(f"Move {source} to {destination}", full_source, full_destination)
+        _remove_empty_folders(full_source)
+    return etag(content)
 
 
 def append_journal(text):

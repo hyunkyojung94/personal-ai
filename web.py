@@ -25,6 +25,7 @@ ERROR_STATUS = {
     notes.InvalidPath: 400,
     notes.NotFound: 404,
     notes.Conflict: 409,
+    notes.DestinationExists: 409,
     notes.PreconditionRequired: 428,
     chats.NotFound: 404,
 }
@@ -186,7 +187,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._allowed(has_body=True):
             return
-        if self.path == "/api/journal":
+        if self.path == "/api/notes/move":
+            def move():
+                body = self._read_json()
+                source, destination = body["from"], body["to"]
+                if not isinstance(source, str) or not isinstance(destination, str):
+                    raise TypeError
+                tag = notes.move_note(source, destination, if_match=self.headers.get("If-Match"))
+                self._send_json(200, {"path": destination}, [("ETag", tag)])
+            self._handle_errors(move)
+        elif self.path == "/api/journal":
             def append():
                 text = self._read_json()["text"]
                 if not isinstance(text, str) or not text.strip():

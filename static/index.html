@@ -73,6 +73,9 @@
   }
   .list button.remove { flex: none; white-space: nowrap; color: var(--muted); padding: 12px 16px; }
   .list small { display: block; color: var(--muted); font-size: 13px; }
+  .list li.folder {
+    padding: 14px 16px 4px; color: var(--muted); font-size: 13px; font-weight: 600; border-bottom: none;
+  }
   .feedback { display: flex; align-items: center; gap: 4px; margin-top: 6px; font-size: 13px; }
   .feedback button {
     background: none; border: 1px solid transparent; border-radius: 12px; padding: 2px 8px;
@@ -508,17 +511,33 @@ function timeAgo(seconds) {
 
 async function loadNotes() {
   const response = await fetch("/api/notes");
-  notesList.innerHTML = "";
+  // Group by folder: top-level notes first, then folders A–Z. The server
+  // already sorts newest first, which each group keeps.
+  const groups = new Map();
   for (const note of await response.json()) {
-    const item = document.createElement("li");
-    const button = document.createElement("button");
-    button.textContent = note.title;
-    const detail = document.createElement("small");
-    detail.textContent = `${note.path} · ${timeAgo(note.modified)}`;
-    button.appendChild(detail);
-    button.addEventListener("click", () => openNote(note.path));
-    item.appendChild(button);
-    notesList.appendChild(item);
+    const folder = note.path.includes("/") ? note.path.slice(0, note.path.lastIndexOf("/") + 1) : "";
+    if (!groups.has(folder)) groups.set(folder, []);
+    groups.get(folder).push(note);
+  }
+  notesList.innerHTML = "";
+  for (const folder of [...groups.keys()].sort()) {
+    if (folder) {
+      const heading = document.createElement("li");
+      heading.className = "folder";
+      heading.textContent = folder;
+      notesList.appendChild(heading);
+    }
+    for (const note of groups.get(folder)) {
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.textContent = note.title;
+      const detail = document.createElement("small");
+      detail.textContent = `${note.path.slice(folder.length)} · ${timeAgo(note.modified)}`;
+      button.appendChild(detail);
+      button.addEventListener("click", () => openNote(note.path));
+      item.appendChild(button);
+      notesList.appendChild(item);
+    }
   }
 }
 
@@ -532,7 +551,6 @@ async function openNote(path) {
 function openEditor(note) {
   current = {...note, saved: note.content};
   editorPath.value = note.path;
-  editorPath.readOnly = note.etag !== null;
   editor.value = note.content;
   editorStatus.textContent = "";
   document.getElementById("delete").hidden = note.etag === null;
@@ -548,7 +566,8 @@ function closeEditor() {
 }
 
 function confirmDiscard() {
-  return !current || editor.value === current.saved || confirm("Discard unsaved changes?");
+  const unchanged = !current || (editor.value === current.saved && editorPath.value.trim() === current.path);
+  return unchanged || confirm("Discard unsaved changes?");
 }
 
 function showConflict(message) {
@@ -559,10 +578,46 @@ function showConflict(message) {
   editorStatus.appendChild(reload);
 }
 
+// Explain a failed move or save in the editor's status line.
+async function reportFailure(response, action) {
+  if (response.status === 409) {
+    const {error} = await response.json();
+    if (error === "DestinationExists" || !current.etag) {
+      editorStatus.textContent = "A note with that name already exists.";
+    } else {
+      showConflict("This note changed somewhere else since you opened it.");
+    }
+  } else if (response.status === 400) {
+    editorStatus.textContent = "Invalid name. Use something like training/plan.md.";
+  } else {
+    editorStatus.textContent = `${action} failed (${response.status}).`;
+  }
+}
+
 document.getElementById("save").addEventListener("click", async () => {
   let path = editorPath.value.trim();
   if (!path) { editorStatus.textContent = "Give the note a name first."; return; }
   if (!path.endsWith(".md")) path += ".md";
+  let moved = false;
+
+  // A changed path on an existing note is a move: one atomic rename on the
+  // server, so the note is never in both places or lost.
+  if (current.etag && path !== current.path) {
+    const response = await fetch("/api/notes/move", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "If-Match": current.etag},
+      body: JSON.stringify({from: current.path, to: path}),
+    });
+    if (!response.ok) { await reportFailure(response, "Move"); return; }
+    current = {...current, path, etag: response.headers.get("ETag")};
+    editorPath.value = path;
+    moved = true;
+  }
+
+  if (current.etag && editor.value === current.saved) {
+    editorStatus.textContent = moved ? "Moved" : "No changes";
+    return;
+  }
   // Optimistic concurrency: say which version we're replacing (If-Match), or
   // that the note must not exist yet (If-None-Match: *). The server answers
   // 409 if someone else changed it in the meantime, instead of overwriting.
@@ -575,16 +630,12 @@ document.getElementById("save").addEventListener("click", async () => {
   if (response.ok) {
     current = {path, etag: response.headers.get("ETag"), saved: editor.value};
     editorPath.value = path;
-    editorPath.readOnly = true;
     document.getElementById("delete").hidden = false;
-    editorStatus.textContent = "Saved";
-  } else if (response.status === 409) {
-    if (current.etag) showConflict("This note changed somewhere else since you opened it.");
-    else editorStatus.textContent = "A note with that name already exists.";
-  } else if (response.status === 400) {
-    editorStatus.textContent = "Invalid name. Use something like training/plan.md.";
+    editorStatus.textContent = moved ? "Moved and saved" : "Saved";
   } else {
-    editorStatus.textContent = `Save failed (${response.status}).`;
+    // If this happens after a move, the move stands; only the text edit
+    // needs retrying.
+    await reportFailure(response, moved ? "Moved, but saving your edits" : "Save");
   }
 });
 
