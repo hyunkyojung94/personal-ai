@@ -12,6 +12,7 @@ Current stage: a chat (terminal or web) that puts every note into the prompt (no
   - `chats.sqlite` — conversations, messages (with model/think/token stats) and feedback (rating, reasons, comment, corrected answer). Inspect with `sqlite3 ~/personal-ai-data/chats.sqlite`.
   - `api-key` — created by `serve.sh` on first run.
 - Model: `~/models/gemma-4-26B_q4_0-it.gguf` (override with `MODEL`).
+- Docs: `docs/external/` (public, in this repo) and `docs/internal/` (a separate private repo, git-ignored here). On a new machine, clone it into place: `git clone git@github-personal:hyunkyojung94/personal-ai-internal.git docs/internal`.
 
 ## Run
 

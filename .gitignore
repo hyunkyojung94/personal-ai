@@ -1,1 +1,3 @@
 __pycache__/
+# Private docs: kept locally, never pushed (the repo is public)
+docs/internal/
