@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from assistant import DATA_DIR
+from config import DATA_DIR
 
 DB_PATH = DATA_DIR / "chats.sqlite"
 FEEDBACK_REASONS = {"wrong_fact", "missed_notes", "made_up", "too_long", "not_helpful", "tone"}

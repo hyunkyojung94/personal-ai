@@ -10,7 +10,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from assistant import NOTES_DIR
+from config import NOTES_DIR
 
 # The web server handles requests on parallel threads. Check-then-write must
 # happen as one step, or two saves could both pass the version check.

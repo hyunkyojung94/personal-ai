@@ -226,7 +226,7 @@ def stream_answer(conversation_id, history, question, think):
                 continue
             if kind == "timings":
                 timings = value
-            else:
+            elif kind in pieces:
                 pieces[kind].append(value)
             yield event(kind, value)
         # Saved only once the answer is complete. If the page is closed, the

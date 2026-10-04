@@ -9,6 +9,7 @@ appends to the journal: that would write to today's real journal note.
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 import sys
@@ -18,7 +19,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
-DATA_DIR = Path.home() / "personal-ai-data"
+DATA_DIR = Path(os.environ.get("PERSONAL_AI_DATA", Path.home() / "personal-ai-data"))
 NOTES_DIR = DATA_DIR / "notes"
 TEST_PREFIX = "zz-test/"
 
