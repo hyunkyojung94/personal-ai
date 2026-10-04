@@ -5,19 +5,26 @@ address. Never on all interfaces, so people on the same café Wi-Fi can't reach 
 """
 
 import json
+import os
+import socket
 import subprocess
-import threading
 import time
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import unquote
+
+import uvicorn
+from fastapi import FastAPI, Header
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
 
 import chats
 import notes
 from assistant import chat
 
-PORT = 8000
+PORT = int(os.environ.get("PORT", "8000"))
 INDEX = Path(__file__).parent / "static" / "index.html"
 # The Mac App Store version of Tailscale doesn't put its CLI on PATH.
 TAILSCALE_CLIS = ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
@@ -50,226 +57,221 @@ def tailscale_self():
     return None, []
 
 
-class Handler(BaseHTTPRequestHandler):
-    def _allowed(self, has_body):
-        """Reject requests that could come from a malicious web page.
+def untrusted_request_error(headers, method):
+    """Why a request could come from a malicious web page, or None if it's fine.
 
-        Host allowlist (every request): blocks DNS rebinding, where an
-        attacker's domain is re-pointed at this machine so the browser treats
-        this app as the attacker's own site.
-        Origin must match Host (writes): blocks cross-site request forgery.
-        The same-origin policy stops other sites reading responses, but not
-        sending requests, and a write only needs to be sent to do damage.
-        JSON body (writes): another site can't send that without a CORS
-        preflight, which this server never approves.
-        """
-        host = self.headers.get("Host", "")
-        if host.rsplit(":", 1)[0] not in allowed_hosts:
-            self.send_error(403, "Unknown Host")
-            return False
-        if self.command == "GET":
-            return True
-        origin = self.headers.get("Origin")
-        # Browsers always send Origin on these requests; tools like curl don't.
-        if origin is not None and origin != f"http://{host}":
-            self.send_error(403, "Cross-origin request")
-            return False
-        if has_body and self.headers.get("Content-Type", "").split(";")[0] != "application/json":
-            self.send_error(415, "Expected application/json")
-            return False
-        return True
+    Host allowlist (every request): blocks DNS rebinding, where an attacker's
+    domain is re-pointed at this machine so the browser treats this app as the
+    attacker's own site.
+    Origin must match Host (writes): blocks cross-site request forgery. The
+    same-origin policy stops other sites reading responses, but not sending
+    requests, and a write only needs to be sent to do damage.
+    JSON body (writes): another site can't send that without a CORS preflight,
+    which this server never approves.
+    """
+    host = headers.get("host", "")
+    if host.rsplit(":", 1)[0] not in allowed_hosts:
+        return 403, "Unknown Host"
+    if method in ("GET", "HEAD"):
+        return None
+    origin = headers.get("origin")
+    # Browsers always send Origin on these requests; tools like curl don't.
+    if origin is not None and origin != f"http://{host}":
+        return 403, "Cross-origin request"
+    if method in ("POST", "PUT") and headers.get("content-type", "").split(";")[0] != "application/json":
+        return 415, "Expected application/json"
+    return None
 
-    def _read_json(self):
-        return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
 
-    def _send_json(self, status, payload, headers=()):
-        body = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        for name, value in headers:
-            self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(body)
+class RejectUntrustedRequests:
+    """Runs the checks above before any route, so no endpoint can forget them."""
 
-    def _tail(self, prefix):
-        """The rest of the path after `prefix`, or None if it doesn't match."""
-        return unquote(self.path[len(prefix):]) if self.path.startswith(prefix) else None
+    def __init__(self, app):
+        self.app = app
 
-    def _note_path(self):
-        return self._tail("/api/notes/")
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            if error := untrusted_request_error(Headers(scope=scope), scope["method"]):
+                status, message = error
+                await JSONResponse({"error": message}, status_code=status)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
-    def _handle_errors(self, action):
-        try:
-            action()
-        except (notes.NoteError, chats.NotFound) as error:
-            self._send_json(ERROR_STATUS[type(error)], {"error": type(error).__name__})
-        except (AttributeError, KeyError, TypeError, ValueError):
-            self.send_error(400)
 
-    def do_GET(self):
-        if not self._allowed(has_body=False):
-            return
-        if self.path == "/":
-            body = INDEX.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/api/notes":
-            self._send_json(200, notes.list_notes())
-        elif path := self._note_path():
-            def read():
-                content, tag = notes.read_note(path)
-                self._send_json(200, {"path": path, "content": content}, [("ETag", tag)])
-            self._handle_errors(read)
-        elif self.path == "/api/conversations":
-            self._send_json(200, chats.list_conversations())
-        elif conversation_id := self._tail("/api/conversations/"):
-            self._handle_errors(
-                lambda: self._send_json(200, chats.get_conversation(conversation_id))
-            )
-        else:
-            self.send_error(404)
+@asynccontextmanager
+async def lifespan(app):
+    notes.ensure_repo()
+    chats.init()
+    yield
 
-    def do_PUT(self):
-        if not self._allowed(has_body=True):
-            return
-        feedback_for = self._tail("/api/messages/")
-        if feedback_for and feedback_for.endswith("/feedback"):
-            def save_feedback():
-                body = self._read_json()
-                chats.set_feedback(
-                    int(feedback_for.removesuffix("/feedback")),
-                    body.get("rating"), list(body.get("reasons") or []),
-                    body.get("comment"), body.get("correction"),
-                )
-                self.send_response(204)
-                self.end_headers()
-            self._handle_errors(save_feedback)
-            return
-        if not (path := self._note_path()):
-            self.send_error(404)
-            return
 
-        def write():
-            content = self._read_json()["content"]
-            if not isinstance(content, str):
-                raise TypeError
-            tag = notes.write_note(
-                path, content,
-                if_match=self.headers.get("If-Match"),
-                create_only=self.headers.get("If-None-Match") == "*",
-            )
-            self._send_json(200, {"path": path}, [("ETag", tag)])
-        self._handle_errors(write)
+# No auto-generated API docs: less surface, and the client is our own page.
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(RejectUntrustedRequests)
 
-    def do_DELETE(self):
-        if not self._allowed(has_body=False):
-            return
-        if path := self._note_path():
-            def delete():
-                notes.delete_note(path, if_match=self.headers.get("If-Match"))
-        elif conversation_id := self._tail("/api/conversations/"):
-            def delete():
-                chats.delete_conversation(conversation_id)
-        else:
-            self.send_error(404)
-            return
 
-        def delete_and_respond():
-            delete()
-            self.send_response(204)
-            self.end_headers()
-        self._handle_errors(delete_and_respond)
+@app.exception_handler(notes.NoteError)
+@app.exception_handler(chats.NotFound)
+async def known_error(request, error):
+    return JSONResponse({"error": type(error).__name__}, status_code=ERROR_STATUS[type(error)])
 
-    def do_POST(self):
-        if not self._allowed(has_body=True):
-            return
-        if self.path == "/api/notes/move":
-            def move():
-                body = self._read_json()
-                source, destination = body["from"], body["to"]
-                if not isinstance(source, str) or not isinstance(destination, str):
-                    raise TypeError
-                tag = notes.move_note(source, destination, if_match=self.headers.get("If-Match"))
-                self._send_json(200, {"path": destination}, [("ETag", tag)])
-            self._handle_errors(move)
-        elif self.path == "/api/journal":
-            def append():
-                text = self._read_json()["text"]
-                if not isinstance(text, str) or not text.strip():
-                    raise ValueError
-                self._send_json(201, {"path": notes.append_journal(text)})
-            self._handle_errors(append)
-        elif self.path == "/api/chat":
-            self._chat()
-        else:
-            self.send_error(404)
 
-    def _chat(self):
-        """Answer `message` in conversation `conversation_id` (null starts a new one).
+@app.exception_handler(RequestValidationError)
+@app.exception_handler(ValueError)
+async def bad_request(request, error):
+    return JSONResponse({"error": "Bad request"}, status_code=400)
 
-        The history comes from the database, not the client, so a conversation
-        can continue on any device.
-        """
-        try:
-            body = self._read_json()
-            question = body["message"]
-            conversation_id = body.get("conversation_id")
-            if not isinstance(question, str) or not question.strip():
-                raise ValueError
-            think = body.get("think") is True
-            history = chats.history(conversation_id) if conversation_id else []
-        except chats.NotFound:
-            self.send_error(404)
-            return
-        except (AttributeError, KeyError, TypeError, ValueError):
-            self.send_error(400)
-            return
 
-        # Stream one JSON object per line as pieces of the reply arrive.
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson")
-        self.end_headers()
+class NoteBody(BaseModel):
+    content: str
 
-        def send(kind, value):
-            self.wfile.write(json.dumps({"kind": kind, "value": value}).encode() + b"\n")
-            self.wfile.flush()
 
-        start = time.monotonic()
-        pieces = {"content": [], "reasoning": []}
-        model = timings = None
-        try:
-            for kind, value in chat([*history, {"role": "user", "content": question}], think=think):
-                if kind == "model":
-                    model = value
-                    continue
-                if kind == "timings":
-                    timings = value
-                else:
-                    pieces[kind].append(value)
-                send(kind, value)
-            # Saved only once the answer is complete: an error or a closed page
-            # leaves no question without its answer in the history.
-            conversation_id, message_id = chats.save_turn(
-                conversation_id, question, "".join(pieces["content"]),
-                reasoning="".join(pieces["reasoning"]), think=think, model=model,
-                timings=timings, latency_ms=round((time.monotonic() - start) * 1000),
-            )
-            send("saved", {"conversation_id": conversation_id, "message_id": message_id})
-        except urllib.error.HTTPError as error:
-            send("error", f"Model server error {error.code}: {error.read().decode()}")
-        except urllib.error.URLError:
-            send("error", "Can't reach the model server. Is serve.sh running?")
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # The page was closed mid-answer; dropping the stream stops generation.
+class MoveBody(BaseModel):
+    source: str = Field(alias="from")
+    destination: str = Field(alias="to")
+
+
+class JournalBody(BaseModel):
+    text: str
+
+
+class ChatBody(BaseModel):
+    message: str
+    conversation_id: str | None = None
+    think: bool = False
+
+
+class FeedbackBody(BaseModel):
+    rating: int | None = None
+    reasons: list[str] = []
+    comment: str | None = None
+    correction: str | None = None
+
+
+@app.get("/")
+def index():
+    return Response(INDEX.read_bytes(), media_type="text/html; charset=utf-8")
+
+
+# ---- Notes ----
+
+@app.get("/api/notes")
+def list_notes():
+    return notes.list_notes()
+
+
+@app.post("/api/notes/move")
+def move_note(body: MoveBody, if_match: str | None = Header(None)):
+    tag = notes.move_note(body.source, body.destination, if_match=if_match)
+    return JSONResponse({"path": body.destination}, headers={"ETag": tag})
+
+
+@app.get("/api/notes/{path:path}")
+def read_note(path: str):
+    content, tag = notes.read_note(path)
+    return JSONResponse({"path": path, "content": content}, headers={"ETag": tag})
+
+
+@app.put("/api/notes/{path:path}")
+def write_note(
+    path: str, body: NoteBody,
+    if_match: str | None = Header(None), if_none_match: str | None = Header(None),
+):
+    tag = notes.write_note(path, body.content, if_match=if_match, create_only=if_none_match == "*")
+    return JSONResponse({"path": path}, headers={"ETag": tag})
+
+
+@app.delete("/api/notes/{path:path}", status_code=204)
+def delete_note(path: str, if_match: str | None = Header(None)):
+    notes.delete_note(path, if_match=if_match)
+
+
+@app.post("/api/journal", status_code=201)
+def append_journal(body: JournalBody):
+    if not body.text.strip():
+        raise ValueError("empty journal entry")
+    return {"path": notes.append_journal(body.text)}
+
+
+# ---- Chat ----
+
+@app.post("/api/chat")
+def chat_endpoint(body: ChatBody):
+    """Answer `message` in conversation `conversation_id` (null starts a new one).
+
+    The history comes from the database, not the client, so a conversation
+    can continue on any device.
+    """
+    if not body.message.strip():
+        raise ValueError("empty message")
+    history = chats.history(body.conversation_id) if body.conversation_id else []
+    return StreamingResponse(
+        stream_answer(body.conversation_id, history, body.message, body.think),
+        media_type="application/x-ndjson",
+    )
+
+
+def stream_answer(conversation_id, history, question, think):
+    """Yield one JSON object per line as pieces of the reply arrive."""
+    def event(kind, value):
+        return json.dumps({"kind": kind, "value": value}) + "\n"
+
+    start = time.monotonic()
+    pieces = {"content": [], "reasoning": []}
+    model = timings = None
+    try:
+        for kind, value in chat([*history, {"role": "user", "content": question}], think=think):
+            if kind == "model":
+                model = value
+                continue
+            if kind == "timings":
+                timings = value
+            else:
+                pieces[kind].append(value)
+            yield event(kind, value)
+        # Saved only once the answer is complete. If the page is closed, the
+        # server stops iterating this generator before reaching this point, so
+        # no question is ever stored without its answer.
+        conversation_id, message_id = chats.save_turn(
+            conversation_id, question, "".join(pieces["content"]),
+            reasoning="".join(pieces["reasoning"]), think=think, model=model,
+            timings=timings, latency_ms=round((time.monotonic() - start) * 1000),
+        )
+        yield event("saved", {"conversation_id": conversation_id, "message_id": message_id})
+    except urllib.error.HTTPError as error:
+        yield event("error", f"Model server error {error.code}: {error.read().decode()}")
+    except urllib.error.URLError:
+        yield event("error", "Can't reach the model server. Is serve.sh running?")
+
+
+@app.get("/api/conversations")
+def list_conversations():
+    return chats.list_conversations()
+
+
+@app.get("/api/conversations/{conversation_id}")
+def get_conversation(conversation_id: str):
+    return chats.get_conversation(conversation_id)
+
+
+@app.delete("/api/conversations/{conversation_id}", status_code=204)
+def delete_conversation(conversation_id: str):
+    chats.delete_conversation(conversation_id)
+
+
+@app.put("/api/messages/{message_id}/feedback", status_code=204)
+def save_feedback(message_id: int, body: FeedbackBody):
+    chats.set_feedback(message_id, body.rating, body.reasons, body.comment, body.correction)
+
+
+def listening_socket(host):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, PORT))
+    return sock
 
 
 def main():
-    notes.ensure_repo()
-    chats.init()
     hosts = ["127.0.0.1"]
     ip, names = tailscale_self()
     if ip:
@@ -278,15 +280,12 @@ def main():
     else:
         print("Tailscale isn't running, so this is only reachable from this Mac.")
 
-    servers = [ThreadingHTTPServer((host, PORT), Handler) for host in hosts]
-    for server in servers[1:]:
-        threading.Thread(target=server.serve_forever, daemon=True).start()
     for host in hosts:
         print(f"Listening on http://{host}:{PORT}")
-    try:
-        servers[0].serve_forever()
-    except KeyboardInterrupt:
-        pass
+    # One server, one socket per address: never 0.0.0.0.
+    uvicorn.Server(uvicorn.Config(app, log_level="info")).run(
+        sockets=[listening_socket(host) for host in hosts]
+    )
 
 
 if __name__ == "__main__":

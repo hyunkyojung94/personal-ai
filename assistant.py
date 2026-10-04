@@ -1,4 +1,4 @@
-"""The assistant itself, shared by the terminal chat and the web app.
+"""The assistant itself: builds the prompt and streams answers from llama-server.
 
 There is no retrieval yet: all notes go into the prompt on every turn. That is
 fine for a handful of notes and breaks as the folder grows, which is the point.
