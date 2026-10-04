@@ -204,14 +204,29 @@ def chat_endpoint(body: ChatBody):
     """
     if not body.message.strip():
         raise ValueError("empty message")
-    history = chats.history(body.conversation_id) if body.conversation_id else []
+    is_new = body.conversation_id is None
+    history = [] if is_new else chats.history(body.conversation_id)
+    conversation_id = chats.new_conversation_id() if is_new else body.conversation_id
     return StreamingResponse(
-        stream_answer(body.conversation_id, history, body.message, body.think),
+        stream_answer(conversation_id, is_new, history, body.message, body.think),
         media_type="application/x-ndjson",
     )
 
 
-def stream_answer(conversation_id, history, question, think):
+class ToolCallAudit:
+    """Writes each tool call to the audit table as it happens, not at turn end."""
+
+    def __init__(self, conversation_id):
+        self.conversation_id = conversation_id
+
+    def started(self, call_id, tool, tier, arguments, arguments_hash):
+        return chats.start_tool_call(call_id, self.conversation_id, tool, tier, arguments, arguments_hash)
+
+    def finished(self, row_id, status, outcome):
+        chats.finish_tool_call(row_id, status, outcome)
+
+
+def stream_answer(conversation_id, is_new, history, question, think):
     """Yield one JSON object per line as pieces of the reply arrive."""
     def event(kind, value):
         return json.dumps({"kind": kind, "value": value}) + "\n"
@@ -219,10 +234,15 @@ def stream_answer(conversation_id, history, question, think):
     start = time.monotonic()
     pieces = {"content": [], "reasoning": []}
     model = timings = None
+    steps = []
     try:
-        for kind, value in chat([*history, {"role": "user", "content": question}], think=think):
+        messages = [*history, {"role": "user", "content": question}]
+        for kind, value in chat(messages, think=think, audit=ToolCallAudit(conversation_id)):
             if kind == "model":
                 model = value
+                continue
+            if kind == "steps":
+                steps = value
                 continue
             if kind == "timings":
                 timings = value
@@ -231,9 +251,10 @@ def stream_answer(conversation_id, history, question, think):
             yield event(kind, value)
         # Saved only once the answer is complete. If the page is closed, the
         # server stops iterating this generator before reaching this point, so
-        # no question is ever stored without its answer.
-        conversation_id, message_id = chats.save_turn(
-            conversation_id, question, "".join(pieces["content"]),
+        # no question is ever stored without its answer. (Tool calls that
+        # already ran are in the audit log regardless.)
+        message_id = chats.save_turn(
+            conversation_id, is_new, question, steps, "".join(pieces["content"]),
             reasoning="".join(pieces["reasoning"]), think=think, model=model,
             timings=timings, latency_ms=round((time.monotonic() - start) * 1000),
         )

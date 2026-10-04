@@ -53,6 +53,53 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     );
     """,
+    # v2: tool use. SQLite can't change a CHECK constraint in place, so the
+    # messages table is rebuilt (create, copy, drop, rename), which is SQLite's
+    # documented procedure. init() runs with foreign keys off, so dropping the
+    # old table doesn't cascade into feedback.
+    """
+    CREATE TABLE messages_v2 (
+        id INTEGER PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        tool_calls TEXT,    -- assistant: JSON list of the tool calls it made
+        tool_call_id TEXT,  -- tool: the call this result answers (tool_calls.call_id)
+        reasoning TEXT,
+        think INTEGER,
+        model TEXT,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        latency_ms INTEGER,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO messages_v2 (id, conversation_id, role, content, reasoning, think, model,
+                             prompt_tokens, completion_tokens, latency_ms, created_at)
+        SELECT id, conversation_id, role, content, reasoning, think, model,
+               prompt_tokens, completion_tokens, latency_ms, created_at FROM messages;
+    DROP TABLE messages;
+    ALTER TABLE messages_v2 RENAME TO messages;
+    CREATE INDEX messages_by_conversation ON messages(conversation_id, id);
+
+    -- Audit log: one row per tool call, written before it runs and updated after.
+    CREATE TABLE tool_calls (
+        id INTEGER PRIMARY KEY,
+        call_id TEXT NOT NULL UNIQUE,   -- the id the model sees
+        conversation_id TEXT NOT NULL,  -- no foreign key: the record outlives a deleted chat
+        tool TEXT NOT NULL,
+        tier INTEGER,                   -- NULL if the model named an unknown tool
+        arguments TEXT NOT NULL,        -- exactly what the model sent
+        arguments_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN (
+            'running', 'executed', 'failed', 'refused',
+            'pending', 'approved', 'denied', 'cancelled')),
+        result TEXT,                    -- JSON outcome given back to the model
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        finished_at TEXT
+    );
+    CREATE INDEX tool_calls_by_conversation ON tool_calls(conversation_id);
+    """,
 ]
 
 
@@ -90,27 +137,43 @@ def init():
 
 
 def history(conversation_id):
-    """The conversation's messages in the shape the model expects."""
+    """The conversation's messages in the shape the model expects, tool calls included."""
     with _db() as db:
         if not db.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone():
             raise NotFound(conversation_id)
         rows = db.execute(
-            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",
+            """SELECT role, content, tool_calls, tool_call_id FROM messages
+               WHERE conversation_id = ? ORDER BY id""",
             (conversation_id,),
         )
-        return [{"role": row["role"], "content": row["content"]} for row in rows]
+        messages = []
+        for row in rows:
+            message = {"role": row["role"], "content": row["content"]}
+            if row["tool_calls"]:
+                message["tool_calls"] = json.loads(row["tool_calls"])
+            if row["tool_call_id"]:
+                message["tool_call_id"] = row["tool_call_id"]
+            messages.append(message)
+        return messages
 
 
-def save_turn(conversation_id, question, answer, *, reasoning, think, model, timings, latency_ms):
-    """Store a question and its answer as one unit; start a conversation if needed.
+def new_conversation_id():
+    """Chosen when a conversation's first turn starts, so tool calls can be
+    logged against it before the turn (and the conversation row) is saved."""
+    return str(uuid.uuid4())
+
+
+def save_turn(conversation_id, is_new, question, steps, answer, *,
+              reasoning, think, model, timings, latency_ms):
+    """Store a whole turn as one unit: the question, any tool-calling steps
+    (model-format assistant and tool messages), and the final answer.
 
     Called only after the answer is complete, so a failed or abandoned answer
-    leaves no half-saved turn behind. Returns (conversation_id, answer_message_id).
+    leaves no half-saved turn behind. Returns the final answer's message id.
     """
     now = _now()
     with _db() as db:
-        if conversation_id is None:
-            conversation_id = str(uuid.uuid4())
+        if is_new:
             title = " ".join(question.split())[:60]
             db.execute(
                 "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -122,6 +185,16 @@ def save_turn(conversation_id, question, answer, *, reasoning, think, model, tim
             "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
             (conversation_id, question, now),
         )
+        for step in steps:
+            db.execute(
+                """INSERT INTO messages (conversation_id, role, content, tool_calls, tool_call_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    conversation_id, step["role"], step["content"] or "",
+                    json.dumps(step["tool_calls"]) if step.get("tool_calls") else None,
+                    step.get("tool_call_id"), now,
+                ),
+            )
         cursor = db.execute(
             """INSERT INTO messages (conversation_id, role, content, reasoning, think, model,
                                      prompt_tokens, completion_tokens, latency_ms, created_at)
@@ -132,7 +205,30 @@ def save_turn(conversation_id, question, answer, *, reasoning, think, model, tim
                 timings and timings["predicted_n"], latency_ms, now,
             ),
         )
-        return conversation_id, cursor.lastrowid
+        return cursor.lastrowid
+
+
+def start_tool_call(call_id, conversation_id, tool, tier, arguments, arguments_hash):
+    """Record a tool call before it runs (status 'running'); returns the audit row id.
+
+    Logging intent first means even a crash mid-action leaves a trace that it
+    was attempted. Committed immediately, independent of the turn.
+    """
+    with _db() as db:
+        return db.execute(
+            """INSERT INTO tool_calls (call_id, conversation_id, tool, tier, arguments,
+                                       arguments_hash, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'running', ?)""",
+            (call_id, conversation_id, tool, tier, arguments, arguments_hash, _now()),
+        ).lastrowid
+
+
+def finish_tool_call(row_id, status, outcome):
+    with _db() as db:
+        db.execute(
+            "UPDATE tool_calls SET status = ?, result = ?, finished_at = ? WHERE id = ?",
+            (status, json.dumps(outcome), _now(), row_id),
+        )
 
 
 def list_conversations():
@@ -149,16 +245,26 @@ def get_conversation(conversation_id):
         if not conversation:
             raise NotFound(conversation_id)
         rows = db.execute(
-            """SELECT m.id, m.role, m.content, m.reasoning,
-                      f.rating, f.reasons, f.comment, f.correction
-               FROM messages m LEFT JOIN feedback f ON f.message_id = m.id
+            """SELECT m.id, m.role, m.content, m.reasoning, m.tool_calls,
+                      f.rating, f.reasons, f.comment, f.correction,
+                      t.tool, t.arguments, t.status, t.result
+               FROM messages m
+               LEFT JOIN feedback f ON f.message_id = m.id
+               LEFT JOIN tool_calls t ON t.call_id = m.tool_call_id
                WHERE m.conversation_id = ? ORDER BY m.id""",
             (conversation_id,),
         )
         messages = []
         for row in rows:
             message = {key: row[key] for key in ("id", "role", "content", "reasoning")}
-            if row["role"] == "assistant":
+            if row["tool_calls"]:
+                message["tool_calls"] = json.loads(row["tool_calls"])
+            elif row["role"] == "tool":
+                message["tool"] = {
+                    "name": row["tool"], "arguments": row["arguments"], "status": row["status"],
+                    **json.loads(row["result"] or row["content"] or "{}"),
+                }
+            elif row["role"] == "assistant":
                 message["feedback"] = {
                     "rating": row["rating"],
                     "reasons": json.loads(row["reasons"] or "[]"),
@@ -185,8 +291,9 @@ def set_feedback(message_id, rating, reasons, comment, correction):
     ):
         raise ValueError("invalid feedback")
     with _db() as db:
-        row = db.execute("SELECT role FROM messages WHERE id = ?", (message_id,)).fetchone()
-        if not row or row["role"] != "assistant":
+        row = db.execute("SELECT role, tool_calls FROM messages WHERE id = ?", (message_id,)).fetchone()
+        # Feedback is on answers, not on the intermediate tool-calling steps.
+        if not row or row["role"] != "assistant" or row["tool_calls"]:
             raise NotFound(message_id)
         if rating is None and not reasons and not comment and not correction:
             db.execute("DELETE FROM feedback WHERE message_id = ?", (message_id,))

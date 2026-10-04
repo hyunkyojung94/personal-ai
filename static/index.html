@@ -44,6 +44,8 @@
   details { color: var(--muted); font-size: 14px; margin-bottom: 8px; white-space: pre-wrap; }
   summary { cursor: pointer; }
   .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .activity { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+  .activity pre { white-space: pre-wrap; font-size: 12px; margin: 4px 0 0; }
   .error { color: #dc2626; }
   .empty { color: var(--muted); text-align: center; margin: auto; padding: 0 24px; }
   #form, .journal {
@@ -217,11 +219,31 @@ function assistantBubble() {
   thinking.innerHTML = "<summary>Thinking…</summary>";
   const thinkingText = document.createElement("div");
   thinking.appendChild(thinkingText);
+  const activity = document.createElement("div");
   const answerEl = document.createElement("div");
   const meta = document.createElement("div");
   meta.className = "meta";
-  bubble.append(thinking, answerEl, meta);
-  return {bubble, thinking, thinkingText, answerEl, meta};
+  bubble.append(thinking, activity, answerEl, meta);
+  return {bubble, thinking, thinkingText, activity, answerEl, meta};
+}
+
+// One line per tool call ("📝 Added to journal/…"); tap to see exactly what was sent.
+function activityLine(call) {
+  const line = document.createElement("details");
+  line.className = "activity";
+  const summary = document.createElement("summary");
+  const result = call.result || {};
+  if (call.status === "executed") {
+    summary.textContent = result.saved_to ? `📝 Added to ${result.saved_to}`
+      : result.created ? `📄 Created ${result.created}` : `🛠 ${call.name}`;
+  } else {
+    summary.textContent = `${call.status === "refused" ? "⛔" : "⚠️"} ${call.name} ${call.status}: ${call.error || ""}`;
+  }
+  const detail = document.createElement("pre");
+  try { detail.textContent = JSON.stringify(JSON.parse(call.arguments), null, 2); }
+  catch { detail.textContent = call.arguments; }
+  line.append(summary, detail);
+  return line;
 }
 
 const REASONS = {
@@ -307,12 +329,17 @@ function addFeedback(bubble, messageId, answer, saved) {
 
 function renderConversation(conversation) {
   log.innerHTML = "";
+  let toolCalls = [];  // shown in the bubble of the answer that follows them
   for (const message of conversation.messages) {
     if (message.role === "user") {
       addBubble("user").textContent = message.content;
       continue;
     }
-    const {bubble, thinking, thinkingText, answerEl} = assistantBubble();
+    if (message.role === "tool") { toolCalls.push(message.tool); continue; }
+    if (message.tool_calls) continue;  // the request itself; its results carry the details
+    const {bubble, thinking, thinkingText, activity, answerEl} = assistantBubble();
+    activity.append(...toolCalls.map(activityLine));
+    toolCalls = [];
     if (message.reasoning) {
       thinking.querySelector("summary").textContent = "Thought process";
       thinkingText.textContent = message.reasoning;
@@ -340,7 +367,7 @@ function startNewChat() {
 
 async function ask(question, think) {
   addBubble("user").textContent = question;
-  const {bubble, thinking, thinkingText, answerEl, meta} = assistantBubble();
+  const {bubble, thinking, thinkingText, activity, answerEl, meta} = assistantBubble();
   scrollToBottom();
 
   const start = performance.now();
@@ -364,6 +391,7 @@ async function ask(question, think) {
         const {kind, value} = JSON.parse(line);
         if (kind === "reasoning" || kind === "content") firstToken ??= performance.now();
         if (kind === "reasoning") thinkingText.textContent += value;
+        else if (kind === "tool") activity.appendChild(activityLine(value));
         else if (kind === "content") {
           if (!answer) thinking.querySelector("summary").textContent = "Thought process";
           answer += value;
