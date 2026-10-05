@@ -2,3 +2,4 @@ __pycache__/
 .venv/
 # Private docs: kept locally, never pushed (the repo is public)
 docs/internal/
+evals/results/

@@ -24,6 +24,7 @@ A personal AI assistant that runs entirely on the owner's own hardware: a local 
 | `chats.py` | SQLite conversations, messages, feedback; migrations via `PRAGMA user_version` |
 | `static/index.html` | The whole web UI (vanilla JS, no build step) |
 | `scripts/smoke_test.py` | End-to-end API checks against the running app (stdlib only) |
+| `evals/tool_choice.py` | Tool-choice eval: fictional cases in `tool_choice_cases.json`, fresh sandbox per case |
 
 Data lives outside the repo in `~/personal-ai-data/` (`notes/`, `chats.sqlite`, `api-key`); model weights in `~/models/`.
 
@@ -35,7 +36,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # once
 .venv/bin/python web.py           # web app on :8000 (localhost + Tailscale address; start after Tailscale connects)
 PORT=8001 .venv/bin/python web.py # a second copy for testing without touching the owner's running app
 python3 scripts/smoke_test.py [http://127.0.0.1:8001]   # must pass before committing API changes
+.venv/bin/python evals/tool_choice.py --repeats 3        # tool-choice eval; run before/after prompt, tool or model changes
 ```
+
+The eval's baseline and how to read it are in `docs/internal/EVALS.md`. Compare retractions/warnings, not just accuracy: the verifier's retry can hide first-try mistakes.
 
 ## Rules
 

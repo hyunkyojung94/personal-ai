@@ -1,0 +1,359 @@
+{
+  "fixtures": {
+    "goals.md": "# Goals\n- Gain 3 kg lean mass by March\n- Eat 140 g protien per day\n- Sleep 8 hours\n",
+    "training/hamstring.md": "# Hamstring rehab\nPhysio plan: Nordic curls 3x/week.\nFirst match back: October 11.\n",
+    "ideas.md": "# Ideas\n- Build a reading tracker\n",
+    "shopping.md": "# Shopping\n- eggs\n- spinach\n",
+    "journal/2026-01-01.md": "# Journal — 2026-01-01\n\n## 09:00\nRan 5k, felt great.\n"
+  },
+  "cases": [
+    {
+      "id": "log-explicit",
+      "category": "append_journal",
+      "prompt": "Log that I did 20 pushups.",
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "20",
+            "pushup"
+          ]
+        }
+      }
+    },
+    {
+      "id": "log-record",
+      "category": "append_journal",
+      "prompt": "Record that I slept 7 hours last night.",
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "7",
+            "hour"
+          ]
+        }
+      }
+    },
+    {
+      "id": "log-journal-verb",
+      "category": "append_journal",
+      "prompt": "Journal that I meditated for 10 minutes.",
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "meditat",
+            "10"
+          ]
+        }
+      }
+    },
+    {
+      "id": "log-feeling",
+      "category": "append_journal",
+      "prompt": "Please journal that I felt anxious before my interview.",
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "anxious",
+            "interview"
+          ]
+        }
+      }
+    },
+    {
+      "id": "log-add-to-journal",
+      "category": "append_journal",
+      "prompt": "Add to today's journal: had a great call with my mentor.",
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "mentor"
+          ]
+        }
+      }
+    },
+    {
+      "id": "log-food",
+      "category": "append_journal",
+      "prompt": "Note in my journal that I skipped lunch.",
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "lunch"
+          ]
+        }
+      }
+    },
+    {
+      "id": "create-explicit-path",
+      "category": "create_note",
+      "prompt": "Create a note at reading/books.md listing two books about habits.",
+      "expect": {
+        "tool": "create_note",
+        "args": {
+          "path": [
+            "reading/books"
+          ]
+        }
+      }
+    },
+    {
+      "id": "create-no-path",
+      "category": "create_note",
+      "prompt": "Make a new note called packing list with passport and charger.",
+      "expect": {
+        "tool": "create_note",
+        "args": {
+          "content": [
+            "passport",
+            "charger"
+          ]
+        }
+      }
+    },
+    {
+      "id": "create-plan",
+      "category": "create_note",
+      "prompt": "Create a note at training/mobility.md with a 3-item hip mobility routine.",
+      "expect": {
+        "tool": "create_note",
+        "args": {
+          "path": [
+            "training/mobility"
+          ]
+        }
+      }
+    },
+    {
+      "id": "edit-number",
+      "category": "edit_note",
+      "prompt": "In goals.md, change 140 g to 150 g.",
+      "expect": {
+        "tool": "edit_note",
+        "args": {
+          "path": [
+            "goals.md"
+          ],
+          "old_text": [
+            "140"
+          ],
+          "new_text": [
+            "150"
+          ]
+        }
+      }
+    },
+    {
+      "id": "edit-typo",
+      "category": "edit_note",
+      "prompt": "Fix the typo 'protien' in goals.md.",
+      "expect": {
+        "tool": "edit_note",
+        "args": {
+          "path": [
+            "goals.md"
+          ],
+          "old_text": [
+            "protien"
+          ],
+          "new_text": [
+            "protein"
+          ]
+        }
+      }
+    },
+    {
+      "id": "edit-date",
+      "category": "edit_note",
+      "prompt": "Update my hamstring note: the first match back is now October 18.",
+      "expect": {
+        "tool": "edit_note",
+        "args": {
+          "path": [
+            "hamstring"
+          ],
+          "new_text": [
+            "18"
+          ]
+        }
+      }
+    },
+    {
+      "id": "move-folder",
+      "category": "move_note",
+      "prompt": "Move ideas.md into a projects folder.",
+      "expect": {
+        "tool": "move_note",
+        "args": {
+          "source": [
+            "ideas.md"
+          ],
+          "destination": [
+            "projects/"
+          ]
+        }
+      }
+    },
+    {
+      "id": "move-rename",
+      "category": "move_note",
+      "prompt": "Rename shopping.md to groceries.md.",
+      "expect": {
+        "tool": "move_note",
+        "args": {
+          "source": [
+            "shopping.md"
+          ],
+          "destination": [
+            "groceries.md"
+          ]
+        }
+      }
+    },
+    {
+      "id": "delete-explicit",
+      "category": "delete_note",
+      "prompt": "Delete my shopping note.",
+      "expect": {
+        "tool": "delete_note",
+        "args": {
+          "path": [
+            "shopping.md"
+          ]
+        }
+      }
+    },
+    {
+      "id": "delete-path",
+      "category": "delete_note",
+      "prompt": "Please delete ideas.md.",
+      "expect": {
+        "tool": "delete_note",
+        "args": {
+          "path": [
+            "ideas.md"
+          ]
+        }
+      }
+    },
+    {
+      "id": "none-fact",
+      "category": "no_tool",
+      "prompt": "When is my first match back?",
+      "expect": {
+        "tool": null
+      }
+    },
+    {
+      "id": "none-advice",
+      "category": "no_tool",
+      "prompt": "Give me one tip for better sleep.",
+      "expect": {
+        "tool": null
+      }
+    },
+    {
+      "id": "none-math",
+      "category": "no_tool",
+      "prompt": "What is 17 times 3?",
+      "expect": {
+        "tool": null
+      }
+    },
+    {
+      "id": "none-past-log",
+      "category": "no_tool",
+      "prompt": "What did I log on January 1?",
+      "expect": {
+        "tool": null
+      }
+    },
+    {
+      "id": "none-capability",
+      "category": "no_tool",
+      "prompt": "Can you log things for me?",
+      "expect": {
+        "tool": null
+      }
+    },
+    {
+      "id": "none-read-note",
+      "category": "no_tool",
+      "prompt": "What's in my goals note?",
+      "expect": {
+        "tool": null
+      }
+    },
+    {
+      "id": "busy-log-feeling",
+      "category": "append_journal_busy",
+      "prompt": "Please journal that I felt anxious before my interview.",
+      "fixtures": {
+        "journal/{today}.md": "# Journal — {today}\n\n## 07:10\nSlept 8 hours.\n\n## 07:45\nAte oatmeal for breakfast.\n\n## 08:30\nFoam rolled my calves.\n\n## 12:15\nSkipped lunch.\n\n## 15:00\nFelt a bit anxious about work.\n\n## 18:30\nRan 5k, no hamstring tightness.\n\n## 19:00\nDid Nordic curls, 3 sets of 5.\n\n## 20:10\nDrank 2 liters of water today.\n"
+      },
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "anxious",
+            "interview"
+          ]
+        }
+      }
+    },
+    {
+      "id": "busy-log-similar",
+      "category": "append_journal_busy",
+      "prompt": "Log that I foam rolled my calves again.",
+      "fixtures": {
+        "journal/{today}.md": "# Journal — {today}\n\n## 07:10\nSlept 8 hours.\n\n## 07:45\nAte oatmeal for breakfast.\n\n## 08:30\nFoam rolled my calves.\n\n## 12:15\nSkipped lunch.\n\n## 15:00\nFelt a bit anxious about work.\n\n## 18:30\nRan 5k, no hamstring tightness.\n\n## 19:00\nDid Nordic curls, 3 sets of 5.\n\n## 20:10\nDrank 2 liters of water today.\n"
+      },
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "foam roll"
+          ]
+        }
+      }
+    },
+    {
+      "id": "busy-log-new",
+      "category": "append_journal_busy",
+      "prompt": "Log that I read 30 pages.",
+      "fixtures": {
+        "journal/{today}.md": "# Journal — {today}\n\n## 07:10\nSlept 8 hours.\n\n## 07:45\nAte oatmeal for breakfast.\n\n## 08:30\nFoam rolled my calves.\n\n## 12:15\nSkipped lunch.\n\n## 15:00\nFelt a bit anxious about work.\n\n## 18:30\nRan 5k, no hamstring tightness.\n\n## 19:00\nDid Nordic curls, 3 sets of 5.\n\n## 20:10\nDrank 2 liters of water today.\n"
+      },
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "30",
+            "page"
+          ]
+        }
+      }
+    },
+    {
+      "id": "busy-log-water",
+      "category": "append_journal_busy",
+      "prompt": "Record that I drank another liter of water.",
+      "fixtures": {
+        "journal/{today}.md": "# Journal — {today}\n\n## 07:10\nSlept 8 hours.\n\n## 07:45\nAte oatmeal for breakfast.\n\n## 08:30\nFoam rolled my calves.\n\n## 12:15\nSkipped lunch.\n\n## 15:00\nFelt a bit anxious about work.\n\n## 18:30\nRan 5k, no hamstring tightness.\n\n## 19:00\nDid Nordic curls, 3 sets of 5.\n\n## 20:10\nDrank 2 liters of water today.\n"
+      },
+      "expect": {
+        "tool": "append_journal",
+        "args": {
+          "text": [
+            "water"
+          ]
+        }
+      }
+    }
+  ]
+}
