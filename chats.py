@@ -100,6 +100,11 @@ MIGRATIONS = [
     );
     CREATE INDEX tool_calls_by_conversation ON tool_calls(conversation_id);
     """,
+    # v3: outcome of checking an answer's claims against what tools did:
+    # JSON {"status": "corrected" | "unverified", "problem", "retracted"?}.
+    """
+    ALTER TABLE messages ADD COLUMN verification TEXT;
+    """,
 ]
 
 
@@ -164,7 +169,7 @@ def new_conversation_id():
 
 
 def save_turn(conversation_id, is_new, question, steps, answer, *,
-              reasoning, think, model, timings, latency_ms):
+              reasoning, think, model, timings, latency_ms, verification=None):
     """Store a whole turn as one unit: the question, any tool-calling steps
     (model-format assistant and tool messages), and the final answer.
 
@@ -197,12 +202,14 @@ def save_turn(conversation_id, is_new, question, steps, answer, *,
             )
         cursor = db.execute(
             """INSERT INTO messages (conversation_id, role, content, reasoning, think, model,
-                                     prompt_tokens, completion_tokens, latency_ms, created_at)
-               VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                     prompt_tokens, completion_tokens, latency_ms, verification,
+                                     created_at)
+               VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 conversation_id, answer, reasoning or None, int(think), model,
                 timings and timings["cache_n"] + timings["prompt_n"],
-                timings and timings["predicted_n"], latency_ms, now,
+                timings and timings["predicted_n"], latency_ms,
+                json.dumps(verification) if verification else None, now,
             ),
         )
         return cursor.lastrowid
@@ -245,7 +252,7 @@ def get_conversation(conversation_id):
         if not conversation:
             raise NotFound(conversation_id)
         rows = db.execute(
-            """SELECT m.id, m.role, m.content, m.reasoning, m.tool_calls,
+            """SELECT m.id, m.role, m.content, m.reasoning, m.tool_calls, m.tool_call_id, m.verification,
                       f.rating, f.reasons, f.comment, f.correction,
                       t.tool, t.arguments, t.status, t.result
                FROM messages m
@@ -261,10 +268,12 @@ def get_conversation(conversation_id):
                 message["tool_calls"] = json.loads(row["tool_calls"])
             elif row["role"] == "tool":
                 message["tool"] = {
-                    "name": row["tool"], "arguments": row["arguments"], "status": row["status"],
+                    "call_id": row["tool_call_id"], "name": row["tool"],
+                    "arguments": row["arguments"], "status": row["status"],
                     **json.loads(row["result"] or row["content"] or "{}"),
                 }
             elif row["role"] == "assistant":
+                message["verification"] = json.loads(row["verification"]) if row["verification"] else None
                 message["feedback"] = {
                     "rating": row["rating"],
                     "reasons": json.loads(row["reasons"] or "[]"),

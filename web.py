@@ -233,7 +233,7 @@ def stream_answer(conversation_id, is_new, history, question, think):
 
     start = time.monotonic()
     pieces = {"content": [], "reasoning": []}
-    model = timings = None
+    model = timings = verification = None
     steps = []
     try:
         messages = [*history, {"role": "user", "content": question}]
@@ -244,6 +244,11 @@ def stream_answer(conversation_id, is_new, history, question, think):
             if kind == "steps":
                 steps = value
                 continue
+            if kind == "verification":
+                verification = value
+                continue
+            if kind == "retract":
+                pieces["content"] = []  # the retracted text isn't the answer
             if kind == "timings":
                 timings = value
             elif kind in pieces:
@@ -257,6 +262,7 @@ def stream_answer(conversation_id, is_new, history, question, think):
             conversation_id, is_new, question, steps, "".join(pieces["content"]),
             reasoning="".join(pieces["reasoning"]), think=think, model=model,
             timings=timings, latency_ms=round((time.monotonic() - start) * 1000),
+            verification=verification,
         )
         yield event("saved", {"conversation_id": conversation_id, "message_id": message_id})
     except urllib.error.HTTPError as error:

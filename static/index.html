@@ -46,6 +46,9 @@
   .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
   .activity { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
   .activity pre { white-space: pre-wrap; font-size: 12px; margin: 4px 0 0; }
+  .receipt { font-size: 12px; color: #15803d; white-space: nowrap; }
+  .receipt.bad, .warning { color: #b45309; }
+  .warning { font-size: 13px; margin-top: 6px; }
   .error { color: #dc2626; }
   .empty { color: var(--muted); text-align: center; margin: auto; padding: 0 24px; }
   #form, .journal {
@@ -227,6 +230,32 @@ function assistantBubble() {
   return {bubble, thinking, thinkingText, activity, answerEl, meta};
 }
 
+// Receipts are ids of tool calls that really ran this turn; the server issues
+// them, so an id the model cites but didn't receive is shown as unknown.
+function renderAnswer(text, receipts) {
+  return renderMarkdown(text).replace(/\[receipt:\s*(call_[0-9a-f]+)\]/g, (_, id) =>
+    receipts.has(id) ? '<span class="receipt">✓ verified</span>' : '<span class="receipt bad">⚠ unknown receipt</span>');
+}
+
+// An answer that failed verification is taken back, but kept visible here.
+function correctionNote(problem, retracted) {
+  const note = document.createElement("details");
+  note.className = "activity";
+  const summary = document.createElement("summary");
+  summary.textContent = "⟲ Corrected after verification";
+  const detail = document.createElement("pre");
+  detail.textContent = `Problem: ${problem}\n\nRetracted answer:\n${retracted}`;
+  note.append(summary, detail);
+  return note;
+}
+
+function warningNote(problem) {
+  const warning = document.createElement("div");
+  warning.className = "warning";
+  warning.textContent = `⚠️ Nothing was saved: ${problem}.`;
+  return warning;
+}
+
 // One line per tool call ("📝 Added to journal/…"); tap to see exactly what was sent.
 function activityLine(call) {
   const line = document.createElement("details");
@@ -337,16 +366,21 @@ function renderConversation(conversation) {
     }
     if (message.role === "tool") { toolCalls.push(message.tool); continue; }
     if (message.tool_calls) continue;  // the request itself; its results carry the details
-    const {bubble, thinking, thinkingText, activity, answerEl} = assistantBubble();
+    const {bubble, thinking, thinkingText, activity, answerEl, meta} = assistantBubble();
     activity.append(...toolCalls.map(activityLine));
+    const receipts = new Set(toolCalls.filter(c => c.status === "executed").map(c => c.call_id));
     toolCalls = [];
+    const verification = message.verification;
+    // The correction happened before any tool calls of the retry, so it goes first.
+    if (verification?.retracted) activity.prepend(correctionNote(verification.problem, verification.retracted));
+    if (verification?.status === "unverified") bubble.insertBefore(warningNote(verification.problem), meta);
     if (message.reasoning) {
       thinking.querySelector("summary").textContent = "Thought process";
       thinkingText.textContent = message.reasoning;
     } else {
       thinking.remove();
     }
-    answerEl.innerHTML = renderMarkdown(message.content);
+    answerEl.innerHTML = renderAnswer(message.content, receipts);
     addFeedback(bubble, message.id, message.content, message.feedback);
   }
   if (!conversation.messages.length) startNewChat();
@@ -371,6 +405,7 @@ async function ask(question, think) {
   scrollToBottom();
 
   const start = performance.now();
+  const receipts = new Set();
   let answer = "", firstToken = null;
   try {
     const response = await fetch("/api/chat", {
@@ -391,11 +426,20 @@ async function ask(question, think) {
         const {kind, value} = JSON.parse(line);
         if (kind === "reasoning" || kind === "content") firstToken ??= performance.now();
         if (kind === "reasoning") thinkingText.textContent += value;
-        else if (kind === "tool") activity.appendChild(activityLine(value));
+        else if (kind === "tool") {
+          activity.appendChild(activityLine(value));
+          if (value.status === "executed") receipts.add(value.call_id);
+        } else if (kind === "retract") {
+          activity.appendChild(correctionNote(value, answer));
+          answer = "";
+          answerEl.innerHTML = "";
+        } else if (kind === "warning") {
+          bubble.insertBefore(warningNote(value), meta);
+        }
         else if (kind === "content") {
           if (!answer) thinking.querySelector("summary").textContent = "Thought process";
           answer += value;
-          answerEl.innerHTML = renderMarkdown(answer);
+          answerEl.innerHTML = renderAnswer(answer, receipts);
         } else if (kind === "timings") {
           meta.textContent = `${value.cache_n + value.prompt_n} prompt tokens · first token ` +
             `${((firstToken - start) / 1000).toFixed(1)}s · ${Math.round(value.predicted_per_second)} tok/s`;
