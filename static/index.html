@@ -49,6 +49,24 @@
   .receipt { font-size: 12px; color: #15803d; white-space: nowrap; }
   .receipt.bad, .warning { color: #b45309; }
   .warning { font-size: 13px; margin-top: 6px; }
+  .approval {
+    border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; margin: 6px 0;
+    background: var(--bg); display: flex; flex-direction: column; gap: 8px;
+  }
+  .approval-title { font-weight: 600; font-size: 14px; }
+  .approval-move { font-size: 14px; overflow-wrap: anywhere; }
+  .approval-status { font-size: 13px; color: var(--muted); }
+  .approval-status:empty { display: none; }
+  .approval-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .approval-actions button { height: 34px; }
+  .diff {
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+    overflow-wrap: anywhere; max-height: 40vh; overflow: auto; margin: 0;
+  }
+  .diff span { display: block; padding: 0 4px; }
+  .diff .add { color: #15803d; background: rgba(21, 128, 61, .1); }
+  .diff .del { color: #dc2626; background: rgba(220, 38, 38, .1); }
+  .diff .hunk { color: var(--muted); }
   .error { color: #dc2626; }
   .empty { color: var(--muted); text-align: center; margin: auto; padding: 0 24px; }
   #form, .journal {
@@ -227,7 +245,7 @@ function assistantBubble() {
   const meta = document.createElement("div");
   meta.className = "meta";
   bubble.append(thinking, activity, answerEl, meta);
-  return {bubble, thinking, thinkingText, activity, answerEl, meta};
+  return {bubble, thinking, thinkingText, activity, answerEl, meta, receipts: new Set(), answer: ""};
 }
 
 // Receipts are ids of tool calls that really ran this turn; the server issues
@@ -365,31 +383,46 @@ function addFeedback(bubble, messageId, answer, saved) {
 
 function renderConversation(conversation) {
   log.innerHTML = "";
-  let toolCalls = [];  // shown in the bubble of the answer that follows them
+  // Tool activity and pending approvals are shown in the bubble of the answer
+  // that follows them; a turn with no answer yet (waiting for approval, or
+  // cancelled) gets a bubble of its own.
+  let toolCalls = [], pending = [];
+  function showToolsWithoutAnswer() {
+    if (!toolCalls.length && !pending.length) return;
+    const ui = assistantBubble();
+    ui.thinking.remove();
+    ui.activity.append(...toolCalls.map(activityLine), ...pending.map(call => approvalCard(call, ui)));
+    toolCalls = [];
+    pending = [];
+  }
   for (const message of conversation.messages) {
     if (message.role === "user") {
+      showToolsWithoutAnswer();
       addBubble("user").textContent = message.content;
       continue;
     }
     if (message.role === "tool") { toolCalls.push(message.tool); continue; }
-    if (message.tool_calls) continue;  // the request itself; its results carry the details
-    const {bubble, thinking, thinkingText, activity, answerEl, meta} = assistantBubble();
-    activity.append(...toolCalls.map(activityLine));
-    const receipts = new Set(toolCalls.filter(c => c.status === "executed").map(c => c.call_id));
+    if (message.tool_calls) { pending.push(...(message.pending || [])); continue; }
+    const ui = assistantBubble();
+    ui.activity.append(...toolCalls.map(activityLine));
+    for (const call of toolCalls) if (call.status === "executed") ui.receipts.add(call.call_id);
     toolCalls = [];
+    pending = [];
     const verification = message.verification;
     // The correction happened before any tool calls of the retry, so it goes first.
-    if (verification?.retracted) activity.prepend(correctionNote(verification.problem, verification.retracted));
-    if (verification?.status === "unverified") bubble.insertBefore(warningNote(verification.problem), meta);
+    if (verification?.retracted) ui.activity.prepend(correctionNote(verification.problem, verification.retracted));
+    if (verification?.status === "unverified") ui.bubble.insertBefore(warningNote(verification.problem), ui.meta);
     if (message.reasoning) {
-      thinking.querySelector("summary").textContent = "Thought process";
-      thinkingText.textContent = message.reasoning;
+      ui.thinking.querySelector("summary").textContent = "Thought process";
+      ui.thinkingText.textContent = message.reasoning;
     } else {
-      thinking.remove();
+      ui.thinking.remove();
     }
-    answerEl.innerHTML = renderAnswer(message.content, receipts);
-    addFeedback(bubble, message.id, message.content, message.feedback);
+    ui.answer = message.content;
+    ui.answerEl.innerHTML = renderAnswer(message.content, ui.receipts);
+    addFeedback(ui.bubble, message.id, message.content, message.feedback);
   }
+  showToolsWithoutAnswer();
   if (!conversation.messages.length) startNewChat();
   scrollToBottom();
 }
@@ -406,21 +439,14 @@ function startNewChat() {
   log.innerHTML = '<p class="empty">Ask about your notes, plans or journal.</p>';
 }
 
-async function ask(question, think) {
-  addBubble("user").textContent = question;
-  const {bubble, thinking, thinkingText, activity, answerEl, meta} = assistantBubble();
-  scrollToBottom();
-
+// Reads a stream of answer events into a bubble. Returns the error, if any;
+// a 409 is returned without being shown, so the caller can explain it.
+async function streamInto(ui, request) {
   const start = performance.now();
-  const receipts = new Set();
-  let answer = "", firstToken = null;
+  let firstToken = null;
   try {
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({conversation_id: conversationId, message: question, think}),
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const response = await request;
+    if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status}`), {status: response.status});
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
     let buffered = "";
     while (true) {
@@ -432,40 +458,138 @@ async function ask(question, think) {
       for (const line of lines.filter(Boolean)) {
         const {kind, value} = JSON.parse(line);
         if (kind === "reasoning" || kind === "content") firstToken ??= performance.now();
-        if (kind === "reasoning") thinkingText.textContent += value;
+        if (kind === "reasoning") ui.thinkingText.textContent += value;
         else if (kind === "tool") {
-          activity.appendChild(activityLine(value));
-          if (value.status === "executed") receipts.add(value.call_id);
+          const card = ui.activity.querySelector(`.approval[data-call-id="${value.call_id}"]`);
+          const shown = value.status === "pending" ? approvalCard(value, ui) : activityLine(value);
+          if (card) card.replaceWith(shown); else ui.activity.appendChild(shown);
+          if (value.status === "executed") ui.receipts.add(value.call_id);
         } else if (kind === "retract") {
-          activity.appendChild(correctionNote(value, answer));
-          answer = "";
-          answerEl.innerHTML = "";
+          ui.activity.appendChild(correctionNote(value, ui.answer));
+          ui.answer = "";
+          ui.answerEl.innerHTML = "";
         } else if (kind === "warning") {
-          bubble.insertBefore(warningNote(value), meta);
-        }
-        else if (kind === "content") {
-          if (!answer) thinking.querySelector("summary").textContent = "Thought process";
-          answer += value;
-          answerEl.innerHTML = renderAnswer(answer, receipts);
+          ui.bubble.insertBefore(warningNote(value), ui.meta);
+        } else if (kind === "content") {
+          if (!ui.answer) ui.thinking.querySelector("summary").textContent = "Thought process";
+          ui.answer += value;
+          ui.answerEl.innerHTML = renderAnswer(ui.answer, ui.receipts);
         } else if (kind === "timings") {
-          meta.textContent = `${value.cache_n + value.prompt_n} prompt tokens · first token ` +
-            `${((firstToken - start) / 1000).toFixed(1)}s · ${Math.round(value.predicted_per_second)} tok/s`;
+          // A turn paused for approval streams no text, so it has no first token.
+          ui.meta.textContent = [
+            `${value.cache_n + value.prompt_n} prompt tokens`,
+            firstToken && `first token ${((firstToken - start) / 1000).toFixed(1)}s`,
+            `${Math.round(value.predicted_per_second)} tok/s`,
+          ].filter(Boolean).join(" · ");
         } else if (kind === "saved") {
           rememberConversation(value.conversation_id);
-          addFeedback(bubble, value.message_id, answer);
+          // Paused for approval: no answer to rate yet.
+          if (value.message_id) addFeedback(ui.bubble, value.message_id, ui.answer);
         } else if (kind === "error") {
           throw new Error(value);
         }
         scrollToBottom();
       }
     }
-    if (!thinkingText.textContent) thinking.remove();
+    if (!ui.thinkingText.textContent) ui.thinking.remove();
+    return null;
   } catch (error) {
-    // Nothing was saved for this turn; the next message continues from the
-    // last saved one.
-    thinking.remove();
-    answerEl.innerHTML = `<span class="error">${escapeHtml(error.message)}</span>`;
+    ui.thinking.remove();
+    if (error.status !== 409) ui.answerEl.innerHTML = `<span class="error">${escapeHtml(error.message)}</span>`;
+    return error;
   }
+}
+
+async function ask(question, think) {
+  addBubble("user").textContent = question;
+  const ui = assistantBubble();
+  scrollToBottom();
+  // On error nothing was saved for this turn; the next message continues
+  // from the last saved one.
+  await streamInto(ui, fetch("/api/chat", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({conversation_id: conversationId, message: question, think}),
+  }));
+}
+
+// ---- Approvals ----
+
+function diffView(diff) {
+  const view = document.createElement("pre");
+  view.className = "diff";
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("---") || line.startsWith("+++")) continue;  // file names are in the title
+    const row = document.createElement("span");
+    row.className = line.startsWith("@@") ? "hunk" : line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : "";
+    row.textContent = line + "\n";
+    view.appendChild(row);
+  }
+  return view;
+}
+
+// Shows exactly what will happen (the server's preview, not the model's
+// description of it), and approves exactly that: the arguments hash is sent
+// back, and the server refuses if it doesn't match.
+function approvalCard(call, ui) {
+  const card = document.createElement("div");
+  card.className = "approval";
+  card.dataset.callId = call.call_id;
+  card.dataset.name = call.name;
+  const preview = call.preview || {};
+  const title = document.createElement("div");
+  title.className = "approval-title";
+  const body = document.createElement("div");
+  if (call.name === "edit_note") {
+    title.textContent = `Approve this edit to ${preview.path}?`;
+    body.appendChild(diffView(preview.diff));
+  } else if (call.name === "move_note") {
+    title.textContent = "Approve this move?";
+    body.className = "approval-move";
+    body.textContent = `${preview.from} → ${preview.to}`;
+  } else if (call.name === "delete_note") {
+    title.textContent = `Approve deleting ${preview.path}?`;
+    const content = document.createElement("pre");
+    content.className = "diff";
+    content.textContent = preview.content;
+    body.appendChild(content);
+  } else {
+    title.textContent = `Approve ${call.name}?`;
+    body.textContent = call.arguments;
+  }
+  const status = document.createElement("div");
+  status.className = "approval-status";
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  for (const [label, approve] of [["Deny", false], ["Approve", true]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = approve ? "primary" : "secondary";
+    button.textContent = label;
+    button.addEventListener("click", () => decide(call, approve, card, ui));
+    actions.appendChild(button);
+  }
+  card.append(title, body, status, actions);
+  return card;
+}
+
+async function decide(call, approve, card, ui) {
+  card.querySelectorAll("button").forEach(button => button.disabled = true);
+  card.querySelector(".approval-status").textContent = approve ? "Applying…" : "Denying…";
+  send.disabled = true;
+  // The response starts with the decided call (which replaces this card),
+  // then streams the model's continuation into the same bubble.
+  const error = await streamInto(ui, fetch(`/api/approvals/${encodeURIComponent(call.call_id)}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({approve, arguments_hash: call.arguments_hash}),
+  }));
+  if (error?.status === 409) {
+    card.querySelector(".approval-status").textContent =
+      "Already decided, maybe on another device. Refreshing…";
+    setTimeout(() => openConversation(conversationId), 1200);
+  }
+  send.disabled = false;
 }
 
 form.addEventListener("submit", async event => {
@@ -475,6 +599,11 @@ form.addEventListener("submit", async event => {
   input.value = "";
   input.style.height = "";
   send.disabled = true;
+  for (const card of log.querySelectorAll(".approval")) {
+    if (!card.querySelector("button:disabled")) {
+      card.replaceWith(activityLine({name: card.dataset.name, status: "cancelled", arguments: "{}"}));
+    }
+  }
   // Thinking applies to one message, then switches back off.
   const think = thinkButton.getAttribute("aria-pressed") === "true";
   thinkButton.setAttribute("aria-pressed", "false");
