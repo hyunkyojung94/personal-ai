@@ -264,7 +264,14 @@ function activityLine(call) {
   const result = call.result || {};
   if (call.status === "executed") {
     summary.textContent = result.saved_to ? `📝 Added to ${result.saved_to}`
-      : result.created ? `📄 Created ${result.created}` : `🛠 ${call.name}`;
+      : result.created ? `📄 Created ${result.created}`
+      : result.edited ? `✏️ Edited ${result.edited}`
+      : result.moved ? `📦 Moved ${result.moved} → ${result.to}`
+      : result.deleted ? `🗑 Deleted ${result.deleted}` : `🛠 ${call.name}`;
+  } else if (call.status === "pending") {
+    summary.textContent = `⏳ ${call.name} is waiting for your approval`;
+  } else if (call.status === "denied" || call.status === "cancelled") {
+    summary.textContent = `✋ ${call.name} ${call.status}`;
   } else {
     summary.textContent = `${call.status === "refused" ? "⛔" : "⚠️"} ${call.name} ${call.status}: ${call.error || ""}`;
   }

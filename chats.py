@@ -105,11 +105,21 @@ MIGRATIONS = [
     """
     ALTER TABLE messages ADD COLUMN verification TEXT;
     """,
+    # v4: approvals. A pending call keeps what the user is shown (preview) and
+    # what must still hold when it runs (precondition, e.g. the note's ETag).
+    """
+    ALTER TABLE tool_calls ADD COLUMN preview TEXT;
+    ALTER TABLE tool_calls ADD COLUMN precondition TEXT;
+    """,
 ]
 
 
 class NotFound(Exception):
     pass
+
+
+class Conflict(Exception):
+    """An approval that was already decided, or for a different action than shown."""
 
 
 def _now():
@@ -173,8 +183,11 @@ def save_turn(conversation_id, is_new, question, steps, answer, *,
     """Store a whole turn as one unit: the question, any tool-calling steps
     (model-format assistant and tool messages), and the final answer.
 
-    Called only after the answer is complete, so a failed or abandoned answer
-    leaves no half-saved turn behind. Returns the final answer's message id.
+    Called only once the turn reaches a stable point, so a failed or abandoned
+    answer leaves no half-saved turn behind. Stable points: the answer is
+    complete, or the turn is paused waiting for approval (answer None). A
+    continuation after an approval has no question (question None).
+    Returns the final answer's message id, or None if paused.
     """
     now = _now()
     with _db() as db:
@@ -186,10 +199,11 @@ def save_turn(conversation_id, is_new, question, steps, answer, *,
             )
         else:
             db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
-        db.execute(
-            "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
-            (conversation_id, question, now),
-        )
+        if question is not None:
+            db.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
+                (conversation_id, question, now),
+            )
         for step in steps:
             db.execute(
                 """INSERT INTO messages (conversation_id, role, content, tool_calls, tool_call_id, created_at)
@@ -200,6 +214,8 @@ def save_turn(conversation_id, is_new, question, steps, answer, *,
                     step.get("tool_call_id"), now,
                 ),
             )
+        if answer is None:
+            return None
         cursor = db.execute(
             """INSERT INTO messages (conversation_id, role, content, reasoning, think, model,
                                      prompt_tokens, completion_tokens, latency_ms, verification,
@@ -228,6 +244,71 @@ def start_tool_call(call_id, conversation_id, tool, tier, arguments, arguments_h
                VALUES (?, ?, ?, ?, ?, ?, 'running', ?)""",
             (call_id, conversation_id, tool, tier, arguments, arguments_hash, _now()),
         ).lastrowid
+
+
+def set_pending(row_id, preview, precondition):
+    """The call is valid and waits for the user; nothing has run yet."""
+    with _db() as db:
+        db.execute(
+            "UPDATE tool_calls SET status = 'pending', preview = ?, precondition = ? WHERE id = ?",
+            (json.dumps(preview), precondition, row_id),
+        )
+
+
+def decide(call_id, approve, arguments_hash):
+    """Approve or deny a pending call; returns its row. Exactly one decision wins.
+
+    Compare-and-set: the UPDATE only matches while the call is still pending
+    and only for the exact action the user was shown (its arguments hash), so
+    two devices approving at once, or an approval of a different action,
+    can't run anything twice or unseen.
+    """
+    with _db() as db:
+        updated = db.execute(
+            """UPDATE tool_calls SET status = ?, decided_at = ?
+               WHERE call_id = ? AND status = 'pending' AND arguments_hash = ?""",
+            ("approved" if approve else "denied", _now(), call_id, arguments_hash),
+        ).rowcount
+        row = db.execute("SELECT * FROM tool_calls WHERE call_id = ?", (call_id,)).fetchone()
+    if row is None:
+        raise NotFound(call_id)
+    if not updated:
+        raise Conflict(call_id)
+    return dict(row)
+
+
+def record_tool_result(conversation_id, call_id, outcome):
+    """Add the result of a resolved approval to the conversation, so history
+    replays correctly (every tool call needs a result before the model goes on)."""
+    with _db() as db:
+        db.execute(
+            """INSERT INTO messages (conversation_id, role, content, tool_call_id, created_at)
+               VALUES (?, 'tool', ?, ?, ?)""",
+            (conversation_id, json.dumps(outcome), call_id, _now()),
+        )
+        db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), conversation_id))
+
+
+def cancel_pending(conversation_id):
+    """The user moved on: cancel any pending approval and tell the model so."""
+    outcome = {"error": "cancelled: the user sent a new message instead of approving"}
+    with _db() as db:
+        pending = db.execute(
+            "SELECT call_id FROM tool_calls WHERE conversation_id = ? AND status = 'pending'",
+            (conversation_id,),
+        ).fetchall()
+        for row in pending:
+            # Same compare-and-set as decide(): skip a call approved a moment ago.
+            if db.execute(
+                "UPDATE tool_calls SET status = 'cancelled', decided_at = ?, finished_at = ?, result = ? "
+                "WHERE call_id = ? AND status = 'pending'",
+                (_now(), _now(), json.dumps(outcome), row["call_id"]),
+            ).rowcount:
+                db.execute(
+                    """INSERT INTO messages (conversation_id, role, content, tool_call_id, created_at)
+                       VALUES (?, 'tool', ?, ?, ?)""",
+                    (conversation_id, json.dumps(outcome), row["call_id"], _now()),
+                )
 
 
 def finish_tool_call(row_id, status, outcome):
@@ -266,6 +347,16 @@ def get_conversation(conversation_id):
             message = {key: row[key] for key in ("id", "role", "content", "reasoning")}
             if row["tool_calls"]:
                 message["tool_calls"] = json.loads(row["tool_calls"])
+                call_ids = [call["id"] for call in message["tool_calls"]]
+                message["pending"] = [
+                    {"call_id": p["call_id"], "name": p["tool"], "arguments": p["arguments"],
+                     "arguments_hash": p["arguments_hash"], "preview": json.loads(p["preview"] or "null")}
+                    for p in db.execute(
+                        f"""SELECT * FROM tool_calls WHERE status = 'pending'
+                            AND call_id IN ({",".join("?" * len(call_ids))})""",
+                        call_ids,
+                    )
+                ]
             elif row["role"] == "tool":
                 message["tool"] = {
                     "call_id": row["tool_call_id"], "name": row["tool"],

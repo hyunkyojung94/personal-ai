@@ -22,7 +22,7 @@ from starlette.datastructures import Headers
 
 import chats
 import notes
-from assistant import chat
+from assistant import chat, run_approved
 
 PORT = int(os.environ.get("PORT", "8000"))
 INDEX = Path(__file__).parent / "static" / "index.html"
@@ -35,6 +35,7 @@ ERROR_STATUS = {
     notes.DestinationExists: 409,
     notes.PreconditionRequired: 428,
     chats.NotFound: 404,
+    chats.Conflict: 409,
 }
 
 # Names this server may be reached by, filled in at startup.
@@ -112,6 +113,7 @@ app.add_middleware(RejectUntrustedRequests)
 
 @app.exception_handler(notes.NoteError)
 @app.exception_handler(chats.NotFound)
+@app.exception_handler(chats.Conflict)
 async def known_error(request, error):
     return JSONResponse({"error": type(error).__name__}, status_code=ERROR_STATUS[type(error)])
 
@@ -138,6 +140,12 @@ class JournalBody(BaseModel):
 class ChatBody(BaseModel):
     message: str
     conversation_id: str | None = None
+    think: bool = False
+
+
+class DecisionBody(BaseModel):
+    approve: bool
+    arguments_hash: str  # of the action the user was shown; must match what would run
     think: bool = False
 
 
@@ -205,10 +213,38 @@ def chat_endpoint(body: ChatBody):
     if not body.message.strip():
         raise ValueError("empty message")
     is_new = body.conversation_id is None
+    if not is_new:
+        chats.history(body.conversation_id)  # 404 before anything changes
+        # Moving on cancels a pending approval (the model is told so).
+        chats.cancel_pending(body.conversation_id)
     history = [] if is_new else chats.history(body.conversation_id)
     conversation_id = chats.new_conversation_id() if is_new else body.conversation_id
     return StreamingResponse(
         stream_answer(conversation_id, is_new, history, body.message, body.think),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.post("/api/approvals/{call_id}")
+def decide_approval(call_id: str, body: DecisionBody):
+    """Approve or deny a pending action, then let the model continue its answer.
+
+    The decision is a compare-and-set, so it wins exactly once (409 otherwise),
+    and only for the exact action the user was shown (its arguments hash).
+    """
+    call = chats.decide(call_id, body.approve, body.arguments_hash)
+    if body.approve:
+        status, outcome = run_approved(call)
+    else:
+        status, outcome = "denied", {"error": "the user denied this action"}
+    chats.finish_tool_call(call["id"], status, outcome)
+    chats.record_tool_result(call["conversation_id"], call_id, outcome)
+    executed = [{"id": call_id, "name": call["tool"]}] if status == "executed" else []
+    resolved = {"call_id": call_id, "name": call["tool"], "arguments": call["arguments"],
+                "status": status, **outcome}
+    return StreamingResponse(
+        stream_answer(call["conversation_id"], False, chats.history(call["conversation_id"]),
+                      None, body.think, executed=executed, resolved=resolved),
         media_type="application/x-ndjson",
     )
 
@@ -222,22 +258,33 @@ class ToolCallAudit:
     def started(self, call_id, tool, tier, arguments, arguments_hash):
         return chats.start_tool_call(call_id, self.conversation_id, tool, tier, arguments, arguments_hash)
 
+    def pending(self, row_id, preview, precondition):
+        chats.set_pending(row_id, preview, precondition)
+
     def finished(self, row_id, status, outcome):
         chats.finish_tool_call(row_id, status, outcome)
 
 
-def stream_answer(conversation_id, is_new, history, question, think):
-    """Yield one JSON object per line as pieces of the reply arrive."""
+def stream_answer(conversation_id, is_new, history, question, think, executed=None, resolved=None):
+    """Yield one JSON object per line as pieces of the reply arrive.
+
+    `question` is None when continuing after an approval decision; `resolved`
+    is then that decided call, sent first so the page can update its card.
+    """
     def event(kind, value):
         return json.dumps({"kind": kind, "value": value}) + "\n"
+
+    if resolved:
+        yield event("tool", resolved)
 
     start = time.monotonic()
     pieces = {"content": [], "reasoning": []}
     model = timings = verification = None
-    steps = []
+    steps, paused = [], False
     try:
-        messages = [*history, {"role": "user", "content": question}]
-        for kind, value in chat(messages, think=think, audit=ToolCallAudit(conversation_id)):
+        messages = [*history, *([{"role": "user", "content": question}] if question is not None else [])]
+        audit = ToolCallAudit(conversation_id)
+        for kind, value in chat(messages, think=think, audit=audit, executed=executed):
             if kind == "model":
                 model = value
                 continue
@@ -247,6 +294,9 @@ def stream_answer(conversation_id, is_new, history, question, think):
             if kind == "verification":
                 verification = value
                 continue
+            if kind == "paused":
+                paused = value
+                continue
             if kind == "retract":
                 pieces["content"] = []  # the retracted text isn't the answer
             if kind == "timings":
@@ -254,17 +304,18 @@ def stream_answer(conversation_id, is_new, history, question, think):
             elif kind in pieces:
                 pieces[kind].append(value)
             yield event(kind, value)
-        # Saved only once the answer is complete. If the page is closed, the
+        # Saved only once the turn reaches a stable point: the answer is
+        # complete, or it's paused for approval. If the page is closed, the
         # server stops iterating this generator before reaching this point, so
-        # no question is ever stored without its answer. (Tool calls that
-        # already ran are in the audit log regardless.)
+        # no question is ever stored half-answered. (Tool calls that already
+        # ran are in the audit log regardless.)
         message_id = chats.save_turn(
-            conversation_id, is_new, question, steps, "".join(pieces["content"]),
+            conversation_id, is_new, question, steps, None if paused else "".join(pieces["content"]),
             reasoning="".join(pieces["reasoning"]), think=think, model=model,
             timings=timings, latency_ms=round((time.monotonic() - start) * 1000),
             verification=verification,
         )
-        yield event("saved", {"conversation_id": conversation_id, "message_id": message_id})
+        yield event("saved", {"conversation_id": conversation_id, "message_id": message_id, "paused": paused})
     except urllib.error.HTTPError as error:
         yield event("error", f"Model server error {error.code}: {error.read().decode()}")
     except urllib.error.URLError:
